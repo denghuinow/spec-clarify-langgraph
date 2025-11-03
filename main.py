@@ -148,6 +148,8 @@ class GraphState(TypedDict):
     max_iterations: int
     srs_output: str
     srs_stream_printed: bool
+    clarification_memory: Dict[str, str]  # {id: clarification_request}
+    pending_clarifications: List[Dict[str, Any]]  # 存储待澄清的需求
 
 
 # -----------------------------
@@ -159,11 +161,30 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
     system = (
-        "你是“需求解析智能体（ReqParse）”。"
-        "任务：从用户自然语言中抽取结构化需求清单，"
-        "分类为功能需求(FR)、非功能需求(NFR)、约束(CON)。"
-        "不要编造缺失信息；输出严格为如下格式：```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n``` "
-        "即 JSON 数组，每项仅包含 id 与 content（类别通过 id 前缀体现）。"
+        '你是"需求解析智能体（ReqParse）"，专门协助开发人员将用户提供的自然语言需求转化为结构化的初始需求清单。\n\n'
+        
+        '## 核心职责\n'
+        '1. 逐段解析用户提供的自然语言需求，识别其中的功能点、输入输出、触发条件、边界情况\n'
+        '2. 将识别出的需求分类为：\n'
+        '   - 功能需求(FR)：系统应提供的具体功能\n'
+        '   - 非功能需求(NFR)：性能、安全、可用性等质量要求\n'
+        '   - 约束(CON)：技术、业务、法律等限制条件\n'
+        '3. 保持原始需求的术语风格和表达习惯，确保格式与用户原始输入保持一致\n'
+        '4. 遇到模糊或不明确的表述时，记录为待澄清项，不自行假设\n\n'
+        
+        '## 输出规范\n'
+        '1. 输出格式严格为：```json\n[{"id": "FR-01", "content": "..."}]\n``` \n'
+        '2. 每项仅包含 id 与 content 两个字段，类别通过 id 前缀体现\n'
+        '3. content 字段保持原始需求的标题层级、编号、术语风格\n'
+        '4. 不要编造缺失信息，保持原始需求的完整性\n\n'
+        
+        '## 质量要求\n'
+        ' - 准确性：忠实地反映用户原始需求\n'
+        ' - 完整性：不遗漏重要的功能点或约束\n'
+        ' - 一致性：保持原始格式和术语风格\n'
+        ' - 清晰性：确保每条需求表述明确无歧义\n\n'
+        
+        '请严格按照上述规范解析用户需求。'
     )
     user = (
         f"用户需求：\n{state['user_input']}\n\n"
@@ -190,24 +211,108 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
-    """ReqExplore：根据逐条评分（+2~−2）优化，输出“新的完整需求清单”（无 action 字段）"""
+    """ReqExplore：根据逐条评分（+2~−2）优化，输出"新的完整需求清单"（无 action 字段）"""
     llm = llm or get_llm()
     log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单")
+    
+    # 初始化记忆和待澄清列表
+    if 'clarification_memory' not in state:
+        state['clarification_memory'] = {}
+    if 'pending_clarifications' not in state:
+        state['pending_clarifications'] = []
+    
     # 将评分 dict 映射为数组，便于展示
     scores_arr = [{"id": rid, "score": sc} for rid, sc in state.get("scores", {}).items()]
 
+    # 如果有评分，根据评分处理澄清
+    if scores_arr:
+        # 处理澄清结果，更新澄清记忆
+        for score_item in scores_arr:
+            req_id = score_item["id"]
+            score = score_item["score"]
+            
+            # 如果评分较低（-1 或 -2），可能需要重新处理该需求
+            if score <= -1 and req_id in state['clarification_memory']:
+                # 从澄清记忆中移除已处理的需求
+                del state['clarification_memory'][req_id]
+    
+    # 提取当前需求清单中的澄清请求并转换为假设性补全
+    current_clarifications = []
+    for req in state['req_list']:
+        content = req['content']
+        # 提取(待澄清: ...)内容并转换为假设性补全
+        clarification_matches = re.findall(r'\(待澄清: (.*?)\)', content)
+        for match in clarification_matches:
+            current_clarifications.append({
+                "id": req['id'],
+                "content": match,
+                "original_content": content
+            })
+    
+    # 更新澄清记忆
+    for clarification in current_clarifications:
+        state['clarification_memory'][clarification['id']] = clarification['content']
+        state['pending_clarifications'].append(clarification)
+    
     system = (
-        "你是“需求挖掘智能体（ReqExplore）”。"
-        "任务：根据上一轮需求清单与逐条评分，生成新的完整需求清单。"
-        "评分含义：\n"
-        "+2 强采纳：完全正确，应保留；\n"
-        "+1 采纳：基本正确，优化表述；\n"
-        " 0 中性：不确定，可保持或略作泛化；\n"
-        "−1 不采纳：存在明显问题，应重新表述；\n"
-        "−2 强不采纳：错误或无关，应删除或用替代需求；\n"
-        "仅使用分数，不使用任何文字澄清意见。"
-        "输出严格为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n``` "
-        "形式的 JSON 数组。若删除请移除该条；若新增请分配新 id（连续编号）。保持已有编号稳定。"
+        '你是"需求挖掘智能体（ReqExplore）"，同时充当资深软件需求分析师兼系统逻辑闭环专家，专门协助开发人员将草稿级功能需求转化为结构完整、逻辑严密、可执行落地的正式文档。\n\n'
+        
+        '## 核心职责\n'
+        '1. 逐条解析原始需求，识别功能点、触发条件、输入输出、状态流转、依赖关系与边界情况\n'
+        '2. 在不改变原意前提下，主动补全缺失细节，直接输出完整的需求描述：\n'
+        '   - 权限控制规则（谁？在什么条件下？）\n'
+        '   - 异常处理路径（失败/超时/冲突/无权限反馈机制）\n'
+        '   - 数据一致性机制（同步策略、冲突解决、幂等性）\n'
+        '   - 状态机定义（状态变更、回退/撤销机制）\n'
+        '   - 用户反馈机制（成功/失败提示、前端交互）\n'
+        '3. 确保每条需求形成完整闭环，包含：触发条件 → 执行逻辑 → 结果输出 → 异常兜底\n'
+        '4. 覆盖正向流程 + 逆向流程（删除/撤回/驳回/重试）\n'
+        '5. 确保数据来源 → 数据处理 → 数据消费 → 数据归档/同步的完整链路\n'
+        '6. 遇到模糊、矛盾、缺失、歧义内容，应直接提出明确的完整需求，而非提出问题或建议补全\n\n'
+        
+        '## 记忆机制\n'
+        '1. 你有澄清记忆，记录了之前识别出的待澄清项：\n'
+        f'{json.dumps(state["clarification_memory"], ensure_ascii=False, indent=2) if state["clarification_memory"] else "无"}\n'
+        '2. 对于澄清记忆中的项目，应基于上下文直接输出明确的完整需求\n'
+        '3. 评分含义：\n'
+        '   - +2 强采纳：保持原需求并精炼，假设性补全被验证为正确\n'
+        '   - +1 采纳：保留并细化，假设性补全基本正确\n'
+        '   - 0 中性：保持或泛化，可能需要调整假设性补全\n'
+        '   - -1 不采纳：需重写或替换，假设性补全需要调整\n'
+        '   - -2 强不采纳：删除或替代，假设性补全需要重新考虑\n\n'
+        
+        '## 输出规范（直接输出完整需求）\n'
+        '1. 格式一致性原则（最高优先级）：\n'
+        '   - 最终输出的标题层级、编号体系、段落缩进、列表符号、术语风格必须与原始需求内容100%一致\n'
+        '   - 禁止重构文档结构、更改编号或标题层级、添加原始文档未使用的格式\n'
+        '2. 输出格式：\n'
+        '   - 直接输出完整的、明确的需求描述，不使用任何标记如(建议补全: ...)或(待澄清: ...)\n'
+        '   - 将所有必要的细节直接整合到需求内容中\n'
+        '3. 绝对禁止使用任何补全标记或问题标记\n\n'
+        
+        '## 自检清单（输出前必查）\n'
+        ' - [ ] 所有操作是否有明确权限控制？\n'
+        ' - [ ] 所有外部依赖是否有失败处理？\n'
+        ' - [ ] 所有"支持XXX"是否定义输入、输出、异常？\n'
+        ' - [ ] 所有自动行为是否定义触发条件、频率、失败策略？\n'
+        ' - [ ] 所有列表是否定义默认排序、分页、检索字段？\n'
+        ' - [ ] 所有状态变更是否有对应事件或回调？\n'
+        ' - [ ] 格式是否与原始需求内容完全一致？\n'
+        ' - [ ] 是否避免了使用任何补全或问题标记？\n\n'
+        
+        '## 最终目标\n'
+        '交付一份满足以下标准的功能规格文档：\n'
+        ' - 逻辑无漏洞\n'
+        ' - 权限无越界\n'
+        ' - 数据无断点\n'
+        ' - 交互无盲区\n'
+        ' - 格式零偏差（与原始内容完全一致）\n'
+        ' - 所有需求都是明确、完整、可执行的\n\n'
+        
+        '请严格按照上述规范，结合评分结果和澄清记忆生成新的完整需求清单。'
+        '直接输出完整的、明确的需求描述，不要使用任何标记格式。'
+        '严禁输出澄清条目的任何解释性文本或表格，只能返回 ```json\n[{"id": "FR-01", "content": "完整的需求描述"}]\n``` 形式的 JSON 数组。'
+        '若删除条目请移除该 id；若新增条目请分配连续的新 id，并保持既有编号稳定。'
     )
     user = (
         "上一轮需求清单（JSON 数组）：\n"
@@ -230,7 +335,18 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         raw_output=resp.content,
         parsed_output=new_list,
     )
+    
+    # 更新需求列表
     state["req_list"] = new_list
+    
+    # 清理已处理的澄清项（基于评分结果）
+    if scores_arr:
+        processed_ids = {item["id"] for item in scores_arr}
+        state['pending_clarifications'] = [
+            item for item in state['pending_clarifications'] 
+            if item['id'] not in processed_ids or item['id'] in state['clarification_memory']
+        ]
+    
     log(f"ReqExplore：生成新的需求清单，共 {len(new_list)} 条")
     return state
 
@@ -241,12 +357,31 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分")
 
     system = (
-        "你是“需求澄清智能体（ReqClarify）”。"
-        "根据生成的需求清单与基准 SRS，对每条需求逐项评分。"
-        "评分标准：+2 强采纳（完全符合），+1 采纳（基本符合），"
-        "0 中性（无法判断或相关性弱），−1 不采纳（部分错误或缺失），−2 强不采纳（严重偏离）。"
-        "请输出 ```json\n[{\"id\": \"FR-01\", \"score\": 1, \"reason\": \"...\"}]\n``` "
-        "形式的 JSON 数组，其中 reason 可省略但需简洁。"
+        '你是"需求澄清智能体（ReqClarify）"，模拟提出需求的用户，负责对生成的需求清单进行评分。\n\n'
+        
+        '## 核心职责\n'
+        '1. 以用户视角评估需求清单中的每项需求\n'
+        '2. 对比基准SRS文档，判断需求是否符合预期\n'
+        '3. 基于业务需要和基准SRS内容对需求进行评分\n'
+        '4. 重点关注需求是否满足业务目标和功能要求\n\n'
+        
+        '## 评分标准\n'
+        ' - +2 强采纳：需求完全符合基准SRS要求，超出预期，非常满意\n'
+        ' - +1 采纳：需求基本符合基准SRS要求，略有改进，满意\n'
+        ' - 0 中性：需求与基准SRS要求基本一致，无明显改进或问题\n'
+        ' - -1 不采纳：需求与基准SRS要求有偏差，需要调整\n'
+        ' - -2 强不采纳：需求严重偏离基准SRS要求，完全不符合预期\n\n'
+        
+        '## 评估依据\n'
+        ' - [ ] 需求是否符合基准SRS中的功能要求？\n'
+        ' - [ ] 需求是否满足业务目标？\n'
+        ' - [ ] 需求是否与基准SRS中的非功能要求一致？\n'
+        ' - [ ] 需求是否体现了基准SRS中的约束条件？\n'
+        ' - [ ] 需求是否与基准SRS中的总体目标相符？\n\n'
+        
+        '## 输出规范\n'
+        '请输出 ```json\n[{"id": "FR-01", "score": 1, "reason": "..."}]\n``` 形式的 JSON 数组，'
+        '其中 reason 可省略但需简洁，重点说明与基准SRS的对比结果和评分依据。'
     )
     user = (
         "需求清单：\n"
@@ -291,12 +426,38 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     stream_handler = StreamingPrinter()
     llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
     system = (
-        "你是“文档生成智能体（DocGenerate）”。"
-        "任务：将最终需求清单生成符合 IEEE 29148-2018 的 SRS 文档（Markdown 格式）。"
-        "最终需求清单的结构为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n```，其中 id 前缀（FR/NFR/CON）标识类别。"
-        "必须包含章节：1 引言（目的/范围），2 总体描述，3 详细需求说明（3.1 功能需求 / 3.2 非功能需求 / 3.3 约束），附录。"
-        "要求：根据 id 前缀分组列出需求，沿用原始 id，语言正式、无二义。"
-        "只输出 Markdown 文档。"
+        '你是"文档生成智能体（DocGenerate）"，专门将经过逻辑闭环完善的需求清单转化为符合 IEEE 29148-2018 标准的正式SRS文档。\n\n'
+        
+        '## 核心职责\n'
+        '1. 将最终需求清单（包含(建议补全)和(待澄清)标识的完整需求）转化为结构化的SRS文档\n'
+        '2. 保持需求的原始编号和ID，确保可追溯性\n'
+        '3. 按照IEEE 29148-2018标准组织文档结构，确保逻辑清晰\n'
+        '4. 将(建议补全)和(待澄清)内容整合为正式的需求表述\n\n'
+        
+        '## 文档结构要求\n'
+        '必须包含以下章节：\n'
+        '1. 引言（目的、范围、定义、参考资料、文档概述）\n'
+        '2. 总体描述（产品概述、产品功能、用户特点、约束、假设和依赖）\n'
+        '3. 详细需求说明：\n'
+        '   3.1 功能需求（FR-XX系列）\n'
+        '   3.2 非功能需求（NFR-XX系列）\n'
+        '   3.3 约束（CON-XX系列）\n'
+        '4. 附录（如需要）\n\n'
+        
+        '## 输出规范\n'
+        '1. 最终需求清单的结构为 ```json\n[{"id": "FR-01", "content": "..."}]\n```，其中 id 前缀（FR/NFR/CON）标识类别\n'
+        '2. 根据 id 前缀分组列出需求，沿用原始 id，语言正式、无二义\n'
+        '3. 将(建议补全: 内容...)和(待澄清: 问题...)整合为完整、正式的需求描述\n'
+        '4. 确保每条需求都具备完整的触发条件→执行逻辑→结果输出→异常兜底的闭环描述\n'
+        '5. 只输出 Markdown 文档，格式清晰易读\n\n'
+        
+        '## 质量要求\n'
+        ' - 结构性：严格遵循IEEE 29148-2018标准结构\n'
+        ' - 完整性：包含所有经过优化的需求项\n'
+        ' - 一致性：保持原始ID和编号体系\n'
+        ' - 正式性：语言正式、逻辑清晰、无歧义\n\n'
+        
+        '请严格按照上述规范生成SRS文档。'
     )
     user = (
         "最终需求清单（JSON 数组）：\n"
@@ -307,6 +468,16 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+    
+    # 记录输入日志
+    record_llm_interaction(
+        state,
+        agent="DocGenerate",
+        iteration=state["iteration"],
+        messages=messages,
+        raw_output=None,
+    )
+    
     print("\n====== 实时 Markdown SRS 输出（流式） ======\n", flush=True)
     resp = llm.invoke(messages)
     print("\n====== 流式输出结束 ======\n", flush=True)
@@ -319,13 +490,8 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         full_text = str(raw_content) if raw_content is not None else ""
     if not full_text:
         full_text = stream_handler.get_text()
-    record_llm_interaction(
-        state,
-        agent="DocGenerate",
-        iteration=state["iteration"],
-        messages=messages,
-        raw_output=full_text,
-    )
+    
+    # 更新日志记录，避免重复
     state["srs_output"] = full_text
     state["srs_stream_printed"] = True
     log("DocGenerate：流式输出完成")
@@ -389,6 +555,8 @@ def run_demo(demo: DemoInput):
         "max_iterations": demo.max_iterations,
         "srs_output": "",
         "srs_stream_printed": False,
+        "clarification_memory": {},
+        "pending_clarifications": [],
     }
     final_state = app.invoke(init)
     log("流程结束，输出结果")
