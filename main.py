@@ -162,10 +162,13 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
         "你是“需求解析智能体（ReqParse）”。"
         "任务：从用户自然语言中抽取结构化需求清单，"
         "分类为功能需求(FR)、非功能需求(NFR)、约束(CON)。"
-        "不要编造缺失信息；输出严格为 JSON 数组：[{id, content}]。"
-        "id 例：FR-01, FR-02, NFR-01, CON-01（类别通过 id 前缀体现）。"
+        "不要编造缺失信息；输出严格为如下格式：```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n``` "
+        "即 JSON 数组，每项仅包含 id 与 content（类别通过 id 前缀体现）。"
     )
-    user = f"用户需求：\n{state['user_input']}\n\n仅输出 JSON 数组。"
+    user = (
+        f"用户需求：\n{state['user_input']}\n\n"
+        "请仅输出结构化 JSON 数组，外层用 ```json``` 包裹。"
+    )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -203,13 +206,15 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         "−1 不采纳：存在明显问题，应重新表述；\n"
         "−2 强不采纳：错误或无关，应删除或用替代需求；\n"
         "仅使用分数，不使用任何文字澄清意见。"
-        "输出严格为 JSON 数组：[{id, content}]。"
-        "若删除请移除该条；若新增请分配新 id（连续编号）。保持已有编号稳定。"
+        "输出严格为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n``` "
+        "形式的 JSON 数组。若删除请移除该条；若新增请分配新 id（连续编号）。保持已有编号稳定。"
     )
     user = (
-        f"上一轮需求清单（JSON 数组）：\n{json.dumps(state['req_list'], ensure_ascii=False)}\n\n"
-        f"逐条评分结果（JSON 数组，来自 ReqClarify）：\n{json.dumps(scores_arr, ensure_ascii=False)}\n\n"
-        "请输出新的完整需求清单（仅 JSON 数组，不含任何解释文本）："
+        "上一轮需求清单（JSON 数组）：\n"
+        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
+        "逐条评分结果（JSON 数组，来自 ReqClarify）：\n"
+        f"```json\n{json.dumps(scores_arr, ensure_ascii=False)}\n```\n\n"
+        "请输出新的完整需求清单（仅 JSON 数组，使用 ```json``` 包裹，不含任何解释文本）："
     )
     messages = [
         {"role": "system", "content": system},
@@ -240,12 +245,17 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         "根据生成的需求清单与基准 SRS，对每条需求逐项评分。"
         "评分标准：+2 强采纳（完全符合），+1 采纳（基本符合），"
         "0 中性（无法判断或相关性弱），−1 不采纳（部分错误或缺失），−2 强不采纳（严重偏离）。"
-        "请输出 JSON 数组：[{id, score, reason}]，其中 reason 可省略但需简洁。"
+        "请输出 ```json\n[{\"id\": \"FR-01\", \"score\": 1, \"reason\": \"...\"}]\n``` "
+        "形式的 JSON 数组，其中 reason 可省略但需简洁。"
     )
     user = (
-        f"需求清单：\n{json.dumps(state['req_list'], ensure_ascii=False)}\n\n"
-        f"基准 SRS：\n{state['reference_srs']}\n\n"
-        "请输出评分 JSON 数组："
+        "需求清单：\n"
+        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
+        "基准 SRS：\n"
+        "```text\n"
+        f"{state['reference_srs']}\n"
+        "```\n\n"
+        "请输出评分 JSON 数组（使用 ```json``` 包裹）："
     )
     messages = [
         {"role": "system", "content": system},
@@ -283,13 +293,14 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     system = (
         "你是“文档生成智能体（DocGenerate）”。"
         "任务：将最终需求清单生成符合 IEEE 29148-2018 的 SRS 文档（Markdown 格式）。"
-        "最终需求清单的结构为 JSON 数组：[{id, content}]，其中 id 前缀（FR/NFR/CON）标识类别。"
+        "最终需求清单的结构为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n```，其中 id 前缀（FR/NFR/CON）标识类别。"
         "必须包含章节：1 引言（目的/范围），2 总体描述，3 详细需求说明（3.1 功能需求 / 3.2 非功能需求 / 3.3 约束），附录。"
         "要求：根据 id 前缀分组列出需求，沿用原始 id，语言正式、无二义。"
         "只输出 Markdown 文档。"
     )
     user = (
-        f"最终需求清单（JSON 数组）：\n{json.dumps(state['req_list'], ensure_ascii=False)}\n\n"
+        "最终需求清单（JSON 数组）：\n"
+        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
         "请输出 Markdown 版本 SRS："
     )
     messages = [
@@ -386,8 +397,6 @@ def run_demo(demo: DemoInput):
     else:
         print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
         print(final_state["srs_output"], flush=True)
-    print("\n====== 评分与日志（仅供审计） ======\n")
-    print(json.dumps(final_state["logs"], ensure_ascii=False, indent=2))
 
 
 # -----------------------------
