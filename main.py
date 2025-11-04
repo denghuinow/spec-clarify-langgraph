@@ -8,10 +8,14 @@ Multi-Agent SRS Generation with LangGraph
 - DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
 
 本版本新增/修订能力：
-1) 统一“评分等级与含义”，集中常量化，便于统一调整并注入到 ReqExplore/ReqClarify；
-2) ReqExplore 显式按评分语义（+2/~ -2）决定保留/细化/重写/删除/替代方向；
-3) 删除所有提示词中对“待澄清”的描述，移除相关处理逻辑；
-4) 保持“最高分冻结 + 冻结项不交给 ReqExplore 优化”的既有机制。
+1) 统一“评分等级与含义”，并拆分为 ReqExplore/ReqClarify 各自的动作语义：
+   - explore_action：面向 ReqExplore 的改写/优化动作；
+   - clarify_action：面向 ReqClarify 的评价口径与反馈立场（代表需求方诉求）。
+2) ReqExplore/ReqClarify 的提示词分别注入各自动作语义，避免语义混淆。
+3) 继续保留：
+   - “最高分冻结 + 冻结项不交给 ReqExplore 优化”；
+   - 对冻结项强制回填与顺序稳定化；
+   - 去除所有提示词里的“待澄清”等占位标记。
 """
 
 from __future__ import annotations
@@ -34,35 +38,48 @@ load_dotenv()
 
 # =========================
 # 统一评分等级定义（集中配置）
+# 拆分 explore_action / clarify_action
 # =========================
 SCORE_POLICY: Dict[int, Dict[str, str]] = {
     2: {
         "label": "强采纳",
-        "explore_action": "保留并微调表达；确认隐含设定为已达成；仅做措辞精炼与条理化，不改变语义。"
+        "explore_action": "保留并微调表达；确认隐含设定为已达成；仅做措辞精炼与条理化，不改变语义。",
+        "clarify_action": "判定与基准 SRS 完全一致或更优；给出高度肯定的简要理由；标注为可直接纳入与优先冻结的候选。"
     },
     1: {
         "label": "采纳",
-        "explore_action": "保留并细化；补充输入/输出、权限、异常、数据一致性、状态机与用户反馈等缺失细节。"
+        "explore_action": "保留并细化；补充输入/输出、权限、异常、数据一致性、状态机与用户反馈等缺失细节。",
+        "clarify_action": "基本符合基准 SRS；指出少量需补充的点（如边界/异常/可观测性），鼓励完善后纳入。"
     },
     0: {
         "label": "中性",
-        "explore_action": "保持或泛化；去除不确定假设，改为条件化表述；提升可检验性与边界定义。"
+        "explore_action": "保持或泛化；去除不确定假设，改为条件化表述；提升可检验性与边界定义。",
+        "clarify_action": "与基准 SRS 等效或信息不足；提示风险点与验证口径，建议保持或泛化后再评估。"
     },
     -1: {
         "label": "不采纳",
-        "explore_action": "重写或替换；对齐基准 SRS 与业务目标；明确触发条件、失败策略与回退路径。"
+        "explore_action": "重写或替换；对齐基准 SRS 与业务目标；明确触发条件、失败策略与回退路径。",
+        "clarify_action": "与基准 SRS 有偏差；指出具体缺口并建议重写方向或替代方案。"
     },
     -2: {
         "label": "强不采纳",
-        "explore_action": "删除或用新条目替代；如保留原 id 则重新定义其 content 以满足基准要求。"
+        "explore_action": "删除或用新条目替代；如保留原 id 则重新定义其 content 以满足基准要求。",
+        "clarify_action": "严重偏离或违背约束；明确拒绝并建议删除或以新条目完全替代。"
     },
 }
 
-def score_policy_text() -> str:
-    lines = ["评分等级与含义（统一定义）:"]
+def score_policy_text(role: str) -> str:
+    """
+    role ∈ {'explore', 'clarify'}
+    返回对应角色可读的评分语义说明文本。
+    """
+    assert role in {"explore", "clarify"}
+    header = "评分等级与含义（统一定义，面向 {}）：".format("ReqExplore" if role == "explore" else "ReqClarify")
+    lines = [header]
     for k in sorted(SCORE_POLICY.keys(), reverse=True):
         v = SCORE_POLICY[k]
-        lines.append(f"{k}（{v['label']}）：{v['explore_action']}")
+        action = v["explore_action"] if role == "explore" else v["clarify_action"]
+        lines.append(f"{k}（{v['label']}）：{action}")
     return "\n".join(lines)
 
 
@@ -276,8 +293,8 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         log("ReqExplore：无未冻结需求，跳过模型调用，需求清单保持不变")
         return state
 
-    # ===== 评分策略文本（统一注入） =====
-    policy_text = score_policy_text()
+    # 评分策略文本（仅面向 ReqExplore）
+    policy_text_explore = score_policy_text("explore")
 
     # 冻结只读清单（仅用于上下文一致性）
     frozen_payload = [
@@ -287,7 +304,7 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
 
     system = (
         '你是"需求挖掘智能体（ReqExplore）"，负责在保持格式/编号稳定的前提下，对“待优化清单（仅未冻结项）”进行闭环补全与优化。\n\n'
-        f"{policy_text}\n\n"
+        f"{policy_text_explore}\n\n"
         "针对每个未冻结 id，按其评分采取对应动作（保留并微调/细化、保持或泛化、重写或替代、或删除）。\n"
         "必要时可新增连续编号的新 id 来承载重写/替代版本；原 id 的处理需与评分语义一致。\n\n"
         "## 只读冻结清单\n"
@@ -355,7 +372,9 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
-    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮最高分"""
+    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮最高分
+    - Clarify 的评分立场代表需求方诉求，明确与基准 SRS 的一致性/偏差与取舍建议。
+    """
     llm = llm or get_llm()
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
 
@@ -371,13 +390,16 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         state["iteration"] += 1
         return state
 
-    policy_text = score_policy_text()
+    # 评分策略文本（仅面向 ReqClarify）
+    policy_text_clarify = score_policy_text("clarify")
+
     system = (
-        '你是"需求澄清智能体（ReqClarify）"，以用户视角对需求清单逐项评分。\n'
-        f"{policy_text}\n\n"
+        '你是"需求澄清智能体（ReqClarify）"，以提出需求的用户/需求方视角对需求清单逐项评分，'
+        '基准 SRS 代表需求方的诉求与底线，评分需以其为裁决依据。\n\n'
+        f"{policy_text_clarify}\n\n"
         "评分标准：+2、+1、0、-1、-2（见上）。\n"
         "输出格式为 ```json\n[{\"id\": \"FR-01\", \"score\": 1, \"reason\": \"...\"}]\n```，"
-        "其中 reason 可省略但需简洁。"
+        "其中 reason 可省略但需简洁、基于基准 SRS 的对照。"
     )
     user = (
         "需评分（未冻结）需求清单：\n"
