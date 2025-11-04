@@ -6,6 +6,10 @@ Multi-Agent SRS Generation with LangGraph
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
 - ReqExplore：仅基于分数优化，输出完整新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
+
+本版本新增能力：
+1) 最高分需求项“冻结暂存”，不再重复评价；
+2) 在 ReqExplore 阶段严格保持冻结项“内容不变、不可删除/重命名”，并在输出后进行强制回填校验；
 """
 
 from __future__ import annotations
@@ -151,6 +155,10 @@ class GraphState(TypedDict):
     clarification_memory: Dict[str, str]  # {id: clarification_request}
     pending_clarifications: List[Dict[str, Any]]  # 存储待澄清的需求
 
+    # ===== 新增：冻结机制 =====
+    frozen_ids: List[str]            # 本轮及历史上被“最高分”选中的需求 id（不再评分）
+    frozen_reqs: Dict[str, str]      # id -> content（冻结版本内容，ReqExplore 不得修改）
+
 
 # -----------------------------
 # 节点实现
@@ -220,6 +228,10 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         state['clarification_memory'] = {}
     if 'pending_clarifications' not in state:
         state['pending_clarifications'] = []
+    if 'frozen_ids' not in state:
+        state['frozen_ids'] = []
+    if 'frozen_reqs' not in state:
+        state['frozen_reqs'] = {}
     
     # 将评分 dict 映射为数组，便于展示
     scores_arr = [{"id": rid, "score": sc} for rid, sc in state.get("scores", {}).items()]
@@ -230,7 +242,6 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         for score_item in scores_arr:
             req_id = score_item["id"]
             score = score_item["score"]
-            
             # 如果评分较低（-1 或 -2），可能需要重新处理该需求
             if score <= -1 and req_id in state['clarification_memory']:
                 # 从澄清记忆中移除已处理的需求
@@ -253,7 +264,13 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     for clarification in current_clarifications:
         state['clarification_memory'][clarification['id']] = clarification['content']
         state['pending_clarifications'].append(clarification)
-    
+
+    # ===== 新增：将冻结集合传入系统提示，明确“不得修改/删除/重命名” =====
+    frozen_payload = [
+        {"id": fid, "content": state["frozen_reqs"].get(fid, "")}
+        for fid in state["frozen_ids"]
+    ]
+
     system = (
         '你是"需求挖掘智能体（ReqExplore）"，同时充当资深软件需求分析师兼系统逻辑闭环专家，专门协助开发人员将草稿级功能需求转化为结构完整、逻辑严密、可执行落地的正式文档。\n\n'
         
@@ -269,6 +286,10 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         '4. 覆盖正向流程 + 逆向流程（删除/撤回/驳回/重试）\n'
         '5. 确保数据来源 → 数据处理 → 数据消费 → 数据归档/同步的完整链路\n'
         '6. 遇到模糊、矛盾、缺失、歧义内容，应直接提出明确的完整需求，而非提出问题或建议补全\n\n'
+        
+        '## 冻结清单（只读）\n'
+        f'{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else "无"}\n'
+        ' - 上述“冻结”条目禁止任何修改、删除或重命名，必须原样出现在最终 JSON 数组里。\n\n'
         
         '## 记忆机制\n'
         '1. 你有澄清记忆，记录了之前识别出的待澄清项：\n'
@@ -335,9 +356,32 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         raw_output=resp.content,
         parsed_output=new_list,
     )
-    
+
+    # ===== 新增：对 LLM 输出进行“冻结项强制回填 + 顺序稳定化”处理 =====
+    # 构建 id->content 映射
+    new_map: Dict[str, str] = {str(item["id"]): str(item["content"]) for item in new_list}
+    prev_ids_order = [str(item["id"]) for item in state["req_list"]]
+
+    # 以上一轮顺序为基线，融合新内容；对冻结 id 强制回填冻结内容
+    merged: List[Dict[str, str]] = []
+    for rid in prev_ids_order:
+        # 从新输出拿内容，否则保留旧内容
+        content = new_map.get(
+            rid,
+            next((it["content"] for it in state["req_list"] if it["id"] == rid), "")
+        )
+        # 冻结覆盖（保证不被修改/删除）
+        if rid in state["frozen_ids"]:
+            content = state["frozen_reqs"].get(rid, content)
+        merged.append({"id": rid, "content": content})
+
+    # 追加新出现的 id（保持模型新增）
+    for rid, content in new_map.items():
+        if rid not in prev_ids_order:
+            merged.append({"id": rid, "content": content})
+
     # 更新需求列表
-    state["req_list"] = new_list
+    state["req_list"] = merged
     
     # 清理已处理的澄清项（基于评分结果）
     if scores_arr:
@@ -347,14 +391,28 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
             if item['id'] not in processed_ids or item['id'] in state['clarification_memory']
         ]
     
-    log(f"ReqExplore：生成新的需求清单，共 {len(new_list)} 条")
+    log(f"ReqExplore：生成新的需求清单，共 {len(state['req_list'])} 条（冻结 {len(state['frozen_ids'])}）")
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
-    """ReqClarify：对每条需求逐项评分，并记录简要理由（不传递给下游）"""
+    """ReqClarify：对每条需求逐项评分，并记录简要理由（不传递给下游）
+
+    本版本改造：
+    - 仅对“未冻结”的需求进行评分；
+    - 本轮评分结束后，自动将“最高分”的需求加入冻结集合，后续不再参与评分；
+    """
     llm = llm or get_llm()
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分")
+
+    # 仅选择未冻结条目参与评价
+    unfrozen_list = [item for item in state["req_list"] if item["id"] not in state.get("frozen_ids", [])]
+    if not unfrozen_list:
+        # 无需调用 LLM；直接推进迭代轮次
+        log("ReqClarify：所有需求均已冻结，本轮跳过评分")
+        state["scores"] = {}
+        state["iteration"] += 1
+        return state
 
     system = (
         '你是"需求澄清智能体（ReqClarify）"，模拟提出需求的用户，负责对生成的需求清单进行评分。\n\n'
@@ -384,8 +442,8 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         '其中 reason 可省略但需简洁，重点说明与基准SRS的对比结果和评分依据。'
     )
     user = (
-        "需求清单：\n"
-        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
+        "需评分的未冻结需求清单：\n"
+        f"```json\n{json.dumps(unfrozen_list, ensure_ascii=False)}\n```\n\n"
         "基准 SRS：\n"
         "```text\n"
         f"{state['reference_srs']}\n"
@@ -415,7 +473,23 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         scores_map[rid] = sc
     state["scores"] = scores_map
 
-    log("ReqClarify：评分记录完成（已通过代码过滤理由供下游使用）")
+    # ===== 新增：将“本轮最高分”的需求冻结（加入 frozen_ids / frozen_reqs），避免后续重复评价 =====
+    if scores_map:
+        max_score = max(scores_map.values())
+        top_ids = [rid for rid, sc in scores_map.items() if sc == max_score]
+        # 建立 req_list 查找表
+        req_map = {str(it["id"]): str(it["content"]) for it in state["req_list"]}
+        added = 0
+        for rid in top_ids:
+            if rid not in state["frozen_ids"]:
+                state["frozen_ids"].append(rid)
+                state["frozen_reqs"][rid] = req_map.get(rid, "")
+                added += 1
+        log(f"ReqClarify：本轮最高分 = {max_score}，新增冻结 {added} 项；累计冻结 {len(state['frozen_ids'])} 项")
+    else:
+        log("ReqClarify：本轮无评分结果，未新增冻结项")
+
+    log("ReqClarify：评分记录完成（未冻结项）")
     state["iteration"] += 1
     return state
 
@@ -557,6 +631,9 @@ def run_demo(demo: DemoInput):
         "srs_stream_printed": False,
         "clarification_memory": {},
         "pending_clarifications": [],
+        # ===== 新增：冻结机制初始态 =====
+        "frozen_ids": [],
+        "frozen_reqs": {},
     }
     final_state = app.invoke(init)
     log("流程结束，输出结果")
