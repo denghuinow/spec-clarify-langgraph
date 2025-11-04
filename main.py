@@ -2,16 +2,20 @@
 """
 Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
-四智能体：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate
+流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate -> END
+
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
 - ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
-- SimEvaluate：使用文本嵌入（不分片）计算“生成文档 vs 基准 SRS”的余弦相似度并打印
+- SimEvaluate：文本嵌入（不分片）评估两类相似度并打印：
+    1) 生成 SRS（srs_output） vs 基准 SRS（reference_srs）
+    2) 用户输入（user_input） vs 基准 SRS（reference_srs）
+   同时打印三侧向量维度（gen/ref/user），维度不一致则跳过对应相似度计算。
 
-本版本新增/修订能力：
-1) 评分语义拆分为：explore_action（给 ReqExplore）与 clarify_action（给 ReqClarify）。
-2) “最高分冻结 + 冻结项不交给 ReqExplore + 强制回填与顺序稳定 + 去除占位标记”保持不变。
-3) 新增独立节点 SimEvaluate：在 DocGenerate 之后计算并打印嵌入相似度（不分片）。
+新增/修订要点：
+1) 评分语义拆分：explore_action（给 ReqExplore）与 clarify_action（给 ReqClarify）。
+2) 冻结：每轮最高分条目加入冻结；冻结项不再交给 ReqExplore，合并时强制回填。
+3) SimEvaluate：除原有 gen vs ref 相似度外，新增 user vs ref 相似度；打印向量维度。
 """
 
 from __future__ import annotations
@@ -216,9 +220,16 @@ class GraphState(TypedDict):
     frozen_ids: List[str]
     frozen_reqs: Dict[str, str]
 
-    # 文档相似度
+    # 文档相似度与维度（gen vs ref）
     embedding_similarity: Optional[float]
     embedding_distance: Optional[float]
+    embedding_dim_gen: Optional[int]
+    embedding_dim_ref: Optional[int]
+
+    # 用户输入 vs 基准 SRS 的相似度与维度
+    embedding_similarity_user_ref: Optional[float]
+    embedding_distance_user_ref: Optional[float]
+    embedding_dim_user: Optional[int]
 
 
 # -----------------------------
@@ -412,30 +423,89 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 
 
 def sim_evaluate_node(state: GraphState) -> GraphState:
-    """SimEvaluate：使用嵌入（不分片）计算生成文档与基准 SRS 的相似度并打印"""
-    log("SimEvaluate：开始计算生成文档与基准 SRS 的文本嵌入相似度（不分片）")
+    """SimEvaluate：嵌入（不分片）计算并打印两类相似度与向量维度：
+        A) 生成文档（srs_output） vs 基准 SRS（reference_srs）
+        B) 用户输入（user_input） vs 基准 SRS（reference_srs）
+    """
+    log("SimEvaluate：开始计算文本嵌入相似度（不分片）")
     if not state.get("srs_output"):
-        log("SimEvaluate：未检测到生成文档内容（srs_output 为空），跳过相似度计算")
-        state["embedding_similarity"] = None
-        state["embedding_distance"] = None
-        return state
+        log("SimEvaluate：未检测到生成文档内容（srs_output 为空），仍将计算 user_input vs reference_srs。")
 
     try:
         emb = get_embeddings_model()
-        vec_gen = emb.embed_query(state["srs_output"])
-        vec_ref = emb.embed_query(state["reference_srs"])
-        sim = cosine_similarity(vec_gen, vec_ref)
-        dist = 1.0 - sim
-        state["embedding_similarity"] = sim
-        state["embedding_distance"] = dist
-        print(f"\n====== 文档与基准 SRS 的嵌入相似度（SimEvaluate） ======\n"
-              f"Cosine Similarity : {sim:.6f}\n"
-              f"Distance (1 - cos): {dist:.6f}\n", flush=True)
-        log(f"SimEvaluate：相似度={sim:.6f}，距离={dist:.6f}")
+
+        # --- (A) 生成文档 vs 基准 SRS ---
+        if state.get("srs_output"):
+            vec_gen = emb.embed_query(state["srs_output"])
+            vec_ref = emb.embed_query(state["reference_srs"])
+            dim_gen = len(vec_gen)
+            dim_ref = len(vec_ref)
+
+            state["embedding_dim_gen"] = dim_gen
+            state["embedding_dim_ref"] = dim_ref
+
+            print(f"\n====== 嵌入信息（SimEvaluate: Generated vs Reference） ======\n"
+                  f"Embedding Dim (Generated) : {dim_gen}\n"
+                  f"Embedding Dim (Reference) : {dim_ref}\n", flush=True)
+            log(f"SimEvaluate：gen/ref 维度 gen={dim_gen}, ref={dim_ref}")
+
+            if dim_gen != dim_ref:
+                log("SimEvaluate：警告——gen/ref 维度不一致，跳过 gen vs ref 相似度计算")
+                state["embedding_similarity"] = None
+                state["embedding_distance"] = None
+            else:
+                sim_gr = cosine_similarity(vec_gen, vec_ref)
+                dist_gr = 1.0 - sim_gr
+                state["embedding_similarity"] = sim_gr
+                state["embedding_distance"] = dist_gr
+                print(f"====== 嵌入相似度（Generated vs Reference） ======\n"
+                      f"Cosine Similarity : {sim_gr:.6f}\n"
+                      f"Distance (1 - cos): {dist_gr:.6f}\n", flush=True)
+                log(f"SimEvaluate：gen vs ref 相似度={sim_gr:.6f}，距离={dist_gr:.6f}")
+        else:
+            state["embedding_dim_gen"] = None
+            state["embedding_dim_ref"] = None
+            state["embedding_similarity"] = None
+            state["embedding_distance"] = None
+
+        # --- (B) 用户输入 vs 基准 SRS ---
+        vec_user = emb.embed_query(state["user_input"])
+        vec_ref2 = emb.embed_query(state["reference_srs"])
+        dim_user = len(vec_user)
+        dim_ref2 = len(vec_ref2)
+
+        state["embedding_dim_user"] = dim_user
+        # 对 ref 维度，若已有（A）则无需覆盖；此处仅用于日志展示
+        print(f"\n====== 嵌入信息（SimEvaluate: UserInput vs Reference） ======\n"
+              f"Embedding Dim (UserInput)  : {dim_user}\n"
+              f"Embedding Dim (Reference)  : {dim_ref2}\n", flush=True)
+        log(f"SimEvaluate：user/ref 维度 user={dim_user}, ref={dim_ref2}")
+
+        if dim_user != dim_ref2:
+            log("SimEvaluate：警告——user/ref 维度不一致，跳过 user vs ref 相似度计算")
+            state["embedding_similarity_user_ref"] = None
+            state["embedding_distance_user_ref"] = None
+        else:
+            sim_ur = cosine_similarity(vec_user, vec_ref2)
+            dist_ur = 1.0 - sim_ur
+            state["embedding_similarity_user_ref"] = sim_ur
+            state["embedding_distance_user_ref"] = dist_ur
+            print(f"====== 嵌入相似度（UserInput vs Reference） ======\n"
+                  f"Cosine Similarity : {sim_ur:.6f}\n"
+                  f"Distance (1 - cos): {dist_ur:.6f}\n", flush=True)
+            log(f"SimEvaluate：user vs ref 相似度={sim_ur:.6f}，距离={dist_ur:.6f}")
+
     except Exception as e:
+        # 统一失败兜底
+        state["embedding_dim_gen"] = state.get("embedding_dim_gen", None)
+        state["embedding_dim_ref"] = state.get("embedding_dim_ref", None)
+        state["embedding_dim_user"] = state.get("embedding_dim_user", None)
         state["embedding_similarity"] = None
         state["embedding_distance"] = None
+        state["embedding_similarity_user_ref"] = None
+        state["embedding_distance_user_ref"] = None
         log(f"SimEvaluate：计算嵌入相似度失败：{e}")
+
     return state
 
 
@@ -460,7 +530,7 @@ def build_graph():
     graph.add_node("ReqExplore", req_explore_node)
     graph.add_node("ReqClarify", req_clarify_node)
     graph.add_node("DocGenerate", doc_generate_node)
-    graph.add_node("SimEvaluate", sim_evaluate_node)  # 新增相似度节点
+    graph.add_node("SimEvaluate", sim_evaluate_node)
 
     graph.set_entry_point("ReqParse")
     graph.add_edge("ReqParse", "ReqExplore")
@@ -469,7 +539,7 @@ def build_graph():
         "ReqExplore": "ReqExplore",
         "DocGenerate": "DocGenerate"
     })
-    graph.add_edge("DocGenerate", "SimEvaluate")  # 文档生成后进入相似度评估
+    graph.add_edge("DocGenerate", "SimEvaluate")
     graph.add_edge("SimEvaluate", END)
     return graph.compile()
 
@@ -499,9 +569,15 @@ def run_demo(demo: DemoInput):
         # 冻结机制
         "frozen_ids": [],
         "frozen_reqs": {},
-        # 相似度初始态
+        # gen vs ref
         "embedding_similarity": None,
         "embedding_distance": None,
+        "embedding_dim_gen": None,
+        "embedding_dim_ref": None,
+        # user vs ref
+        "embedding_similarity_user_ref": None,
+        "embedding_distance_user_ref": None,
+        "embedding_dim_user": None,
     }
     final_state = app.invoke(init)
     log("流程结束，输出结果")
@@ -511,11 +587,25 @@ def run_demo(demo: DemoInput):
         print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
         print(final_state["srs_output"], flush=True)
 
-    # 可选：在流程末尾再次摘要相似度（SimEvaluate 已打印过，这里仅回显）
-    sim = final_state.get("embedding_similarity", None)
-    dist = final_state.get("embedding_distance", None)
-    if sim is not None and dist is not None:
-        print(f"（摘要）Cosine Similarity : {sim:.6f} | Distance : {dist:.6f}\n", flush=True)
+    # 摘要回显（SimEvaluate 已打印详细信息）
+    print("\n====== 相似度摘要 ======", flush=True)
+    print("Dims => gen: {}, ref: {}, user: {}".format(
+        final_state.get("embedding_dim_gen"),
+        final_state.get("embedding_dim_ref"),
+        final_state.get("embedding_dim_user")
+    ), flush=True)
+    sim_gr = final_state.get("embedding_similarity")
+    dst_gr = final_state.get("embedding_distance")
+    sim_ur = final_state.get("embedding_similarity_user_ref")
+    dst_ur = final_state.get("embedding_distance_user_ref")
+    if sim_gr is not None and dst_gr is not None:
+        print(f"Generated vs Reference => Cosine: {sim_gr:.6f}, Distance: {dst_gr:.6f}", flush=True)
+    else:
+        print("Generated vs Reference => 未计算（维度不一致或错误）", flush=True)
+    if sim_ur is not None and dst_ur is not None:
+        print(f"UserInput vs Reference => Cosine: {sim_ur:.6f}, Distance: {dst_ur:.6f}", flush=True)
+    else:
+        print("UserInput vs Reference => 未计算（维度不一致或错误）", flush=True)
 
 
 # -----------------------------
