@@ -2,20 +2,16 @@
 """
 Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
-四智能体：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate
+四智能体：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
-- ReqExplore：仅基于分数优化，输出完整新版本清单（JSON 数组，仅含 id/content）
+- ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
+- SimEvaluate：使用文本嵌入（不分片）计算“生成文档 vs 基准 SRS”的余弦相似度并打印
 
 本版本新增/修订能力：
-1) 统一“评分等级与含义”，并拆分为 ReqExplore/ReqClarify 各自的动作语义：
-   - explore_action：面向 ReqExplore 的改写/优化动作；
-   - clarify_action：面向 ReqClarify 的评价口径与反馈立场（代表需求方诉求）。
-2) ReqExplore/ReqClarify 的提示词分别注入各自动作语义，避免语义混淆。
-3) 继续保留：
-   - “最高分冻结 + 冻结项不交给 ReqExplore 优化”；
-   - 对冻结项强制回填与顺序稳定化；
-   - 去除所有提示词里的“待澄清”等占位标记。
+1) 评分语义拆分为：explore_action（给 ReqExplore）与 clarify_action（给 ReqClarify）。
+2) “最高分冻结 + 冻结项不交给 ReqExplore + 强制回填与顺序稳定 + 去除占位标记”保持不变。
+3) 新增独立节点 SimEvaluate：在 DocGenerate 之后计算并打印嵌入相似度（不分片）。
 """
 
 from __future__ import annotations
@@ -26,8 +22,10 @@ import os
 import re
 from typing import Any, Dict, List, Optional, TypedDict
 
+import numpy as np
+
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI  # 若使用其他模型，可替换为相应 LangChain 接口
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.callbacks.base import BaseCallbackHandler
 from pydantic import BaseModel, Field
 
@@ -49,7 +47,7 @@ SCORE_POLICY: Dict[int, Dict[str, str]] = {
     1: {
         "label": "采纳",
         "explore_action": "保留并细化；补充输入/输出、权限、异常、数据一致性、状态机与用户反馈等缺失细节。",
-        "clarify_action": "基本符合基准 SRS；指出少量需补充的点（如边界/异常/可观测性），鼓励完善后纳入。"
+        "clarify_action": "基本符合基准 SRS；指出少量需补充的点（边界/异常/可观测性），鼓励完善后纳入。"
     },
     0: {
         "label": "中性",
@@ -70,8 +68,7 @@ SCORE_POLICY: Dict[int, Dict[str, str]] = {
 
 def score_policy_text(role: str) -> str:
     """
-    role ∈ {'explore', 'clarify'}
-    返回对应角色可读的评分语义说明文本。
+    role ∈ {'explore', 'clarify'}，返回对应角色可读的评分语义说明文本。
     """
     assert role in {"explore", "clarify"}
     header = "评分等级与含义（统一定义，面向 {}）：".format("ReqExplore" if role == "explore" else "ReqClarify")
@@ -84,9 +81,7 @@ def score_policy_text(role: str) -> str:
 
 
 def read_text_file(file_path: str, label: str) -> str:
-    """
-    Read UTF-8 text from the given file path, raising a helpful error if missing.
-    """
+    """Read UTF-8 text from the given file path, raising a helpful error if missing."""
     resolved_path = os.path.expanduser(file_path)
     if not os.path.isfile(resolved_path):
         raise FileNotFoundError(f"{label} 文件不存在: {file_path}")
@@ -109,7 +104,7 @@ def record_llm_interaction(
     raw_output: Any,
     parsed_output: Any = None,
 ) -> None:
-    """Append a structured log entry capturing每次模型调用的输入与输出，并立即打印。"""
+    """记录每次模型调用的输入与输出，并立即打印。"""
     if isinstance(raw_output, list):
         raw_text = "".join(str(part) for part in raw_output)
     elif isinstance(raw_output, str):
@@ -127,7 +122,6 @@ def record_llm_interaction(
         entry["parsed_output"] = parsed_output
     state["logs"].append(entry)
 
-    # 及时打印模型交互内容
     pretty_messages = json.dumps(messages, ensure_ascii=False, indent=2)
     log(f"{agent}（第 {iteration} 轮）输入：\n{pretty_messages}")
     if parsed_output is not None:
@@ -139,7 +133,6 @@ def record_llm_interaction(
 
 class StreamingPrinter(BaseCallbackHandler):
     """Stream tokens to stdout while buffering the full text."""
-
     def __init__(self) -> None:
         self._buffer: List[str] = []
 
@@ -152,7 +145,7 @@ class StreamingPrinter(BaseCallbackHandler):
 
 
 # -----------------------------
-# LLM 工具（可替换为任意 LangChain 聊天模型）
+# LLM / Embeddings
 # -----------------------------
 def get_llm(
     model: str = None,
@@ -162,10 +155,7 @@ def get_llm(
 ):
     model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     base_url = os.environ.get("OPENAI_BASE_URL")
-    kwargs: Dict[str, Any] = {
-        "model": model,
-        "temperature": temperature,
-    }
+    kwargs: Dict[str, Any] = {"model": model, "temperature": temperature}
     if base_url:
         kwargs["base_url"] = base_url
     if streaming:
@@ -175,12 +165,18 @@ def get_llm(
     return ChatOpenAI(**kwargs)
 
 
+def get_embeddings_model(model: str = None):
+    """默认 text-embedding-3-large；兼容 OPENAI_BASE_URL。"""
+    model = model or os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    kwargs: Dict[str, Any] = {"model": model}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAIEmbeddings(**kwargs)
+
+
 def extract_first_json(text: str) -> Any:
-    """
-    从模型输出中提取第一个 JSON 数组或对象。
-    兼容出现多余文本或代码围栏的情况。
-    """
-    # 先尝试从 ```json ... ``` 中提取
+    """从模型输出中提取第一个 JSON 数组或对象（容错围栏/噪声）。"""
     fence = re.findall(r"```json\s*(\{.*?\}|\[.*?\])\s*```", text, flags=re.S)
     candidates = fence if fence else re.findall(r"(\{.*?\}|\[.*?\])", text, flags=re.S)
     for c in candidates:
@@ -189,6 +185,17 @@ def extract_first_json(text: str) -> Any:
         except Exception:
             continue
     raise ValueError("未能从模型输出中解析出有效 JSON。原始输出:\n" + text)
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """计算余弦相似度。"""
+    va = np.array(a, dtype=np.float32)
+    vb = np.array(b, dtype=np.float32)
+    na = np.linalg.norm(va)
+    nb = np.linalg.norm(vb)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / (na * nb))
 
 
 # -----------------------------
@@ -206,8 +213,12 @@ class GraphState(TypedDict):
     srs_stream_printed: bool
 
     # 冻结机制
-    frozen_ids: List[str]            # 被“最高分”选中的需求 id（不再评分/不再交给 ReqExplore）
-    frozen_reqs: Dict[str, str]      # id -> content（冻结版本内容，ReqExplore 不得修改）
+    frozen_ids: List[str]
+    frozen_reqs: Dict[str, str]
+
+    # 文档相似度
+    embedding_similarity: Optional[float]
+    embedding_distance: Optional[float]
 
 
 # -----------------------------
@@ -219,49 +230,16 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
     system = (
-        '你是"需求解析智能体（ReqParse）"，专门协助开发人员将用户提供的自然语言需求转化为结构化的初始需求清单。\n\n'
-        
-        '## 核心职责\n'
-        '1. 逐段解析用户提供的自然语言需求，识别其中的功能点、输入输出、触发条件、边界情况。\n'
-        '2. 将识别出的需求分类为：\n'
-        '   - 功能需求(FR)：系统应提供的具体功能。\n'
-        '   - 非功能需求(NFR)：性能、安全、可用性等质量要求。\n'
-        '   - 约束(CON)：技术、业务、法律等限制条件。\n'
-        '3. 保持原始需求的术语风格和表达习惯，确保格式与用户原始输入保持一致。\n'
-        '4. 对不明确内容，不作推断，不引入任何标记或占位符。\n\n'
-        
-        '## 输出规范\n'
-        '1. 输出格式严格为：```json\n[{"id": "FR-01", "content": "..."}]\n``` \n'
-        '2. 每项仅包含 id 与 content 两个字段，类别通过 id 前缀体现。\n'
-        '3. content 字段保持原始需求的标题层级、编号、术语风格。\n'
-        '4. 不要编造缺失信息，保持原始需求的完整性。\n\n'
-        
-        '## 质量要求\n'
-        ' - 准确性：忠实地反映用户原始需求。\n'
-        ' - 完整性：不遗漏重要的功能点或约束。\n'
-        ' - 一致性：保持原始格式和术语风格。\n'
-        ' - 清晰性：确保每条需求表述明确无歧义。\n\n'
-        
-        '请严格按照上述规范解析用户需求。'
+        '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为结构化初始清单。\n\n'
+        '输出规范：```json\n[{"id": "FR-01", "content": "..."}]\n```（仅 id 与 content）。\n'
+        '不得引入占位或问题标记；保持原术语与风格一致。'
     )
-    user = (
-        f"用户需求：\n{state['user_input']}\n\n"
-        "请仅输出结构化 JSON 数组，外层用 ```json``` 包裹。"
-    )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    user = f"用户需求：\n{state['user_input']}\n\n请仅输出结构化 JSON 数组，外层用 ```json``` 包裹。"
+    messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
     resp = llm.invoke(messages)
     parsed = extract_first_json(resp.content)
-    record_llm_interaction(
-        state,
-        agent="ReqParse",
-        iteration=current_iteration,
-        messages=messages,
-        raw_output=resp.content,
-        parsed_output=parsed,
-    )
+    record_llm_interaction(state, agent="ReqParse", iteration=current_iteration,
+                           messages=messages, raw_output=resp.content, parsed_output=parsed)
     state["req_list"] = parsed
     state["iteration"] = current_iteration
     log(f"ReqParse：解析完成，共 {len(parsed)} 条需求")
@@ -272,117 +250,75 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     """ReqExplore：根据评分优化未冻结条目，输出新的完整需求清单（不处理冻结项）"""
     llm = llm or get_llm()
     log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单（冻结项不参与）")
-    
-    # 初始化冻结集合
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
     frozen_ids_set = set(state['frozen_ids'])
 
-    # 仅保留“未冻结”的评分传给提示
-    scores_arr_unfrozen = [
-        {"id": rid, "score": sc}
-        for rid, sc in state.get("scores", {}).items()
-        if rid not in frozen_ids_set
-    ]
-
-    # “待优化清单”：仅未冻结项
+    scores_arr_unfrozen = [{"id": rid, "score": sc}
+                           for rid, sc in state.get("scores", {}).items()
+                           if rid not in frozen_ids_set]
     unfrozen_list = [it for it in state['req_list'] if it['id'] not in frozen_ids_set]
-
-    # 若无未冻结项，直接跳过模型调用
     if not unfrozen_list:
         log("ReqExplore：无未冻结需求，跳过模型调用，需求清单保持不变")
         return state
 
-    # 评分策略文本（仅面向 ReqExplore）
     policy_text_explore = score_policy_text("explore")
-
-    # 冻结只读清单（仅用于上下文一致性）
-    frozen_payload = [
-        {"id": fid, "content": state["frozen_reqs"].get(fid, "")}
-        for fid in state["frozen_ids"]
-    ]
+    frozen_payload = [{"id": fid, "content": state["frozen_reqs"].get(fid, "")}
+                      for fid in state["frozen_ids"]]
 
     system = (
-        '你是"需求挖掘智能体（ReqExplore）"，负责在保持格式/编号稳定的前提下，对“待优化清单（仅未冻结项）”进行闭环补全与优化。\n\n'
+        '你是"需求挖掘智能体（ReqExplore）"，仅对未冻结 id 做闭环补全与优化。\n\n'
         f"{policy_text_explore}\n\n"
-        "针对每个未冻结 id，按其评分采取对应动作（保留并微调/细化、保持或泛化、重写或替代、或删除）。\n"
-        "必要时可新增连续编号的新 id 来承载重写/替代版本；原 id 的处理需与评分语义一致。\n\n"
-        "## 只读冻结清单\n"
-        f"{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}\n"
-        " - 冻结清单**只读**，你不得输出或修改这些 id；最终结果会由系统自动合并。\n\n"
-        "## 输出规范（直接输出完整需求）\n"
-        " - 仅输出未冻结及新增 id 的数组；\n"
-        " - 保持与输入相同的标题/编号/术语风格；\n"
-        " - 输出闭环需求：触发条件 → 执行逻辑 → 结果输出 → 异常兜底；\n"
-        " - 输出为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n```；\n"
-        " - 禁止出现任何占位/补全/问题标记。\n"
+        "按评分采取动作（保留并微调/细化、保持或泛化、重写或替代、删除）。可新增连续编号的新 id 承载替代稿。\n"
+        "只读冻结清单如下（严禁输出或修改这些 id；系统稍后自动合并）：\n"
+        f"{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}\n\n"
+        "输出为 ```json\n[{\"id\": \"FR-01\", \"content\": \"...\"}]\n```，仅包含未冻结及新增 id；"
+        "不得出现占位或问题标记；保持编号/风格一致；每条包含触发→逻辑→输出→异常兜底。"
     )
     user = (
-        "待优化清单（仅未冻结项，JSON 数组）：\n"
+        "待优化清单（仅未冻结项）：\n"
         f"```json\n{json.dumps(unfrozen_list, ensure_ascii=False)}\n```\n\n"
-        "逐条评分结果（仅未冻结项）：\n"
+        "逐条评分（仅未冻结项）：\n"
         f"```json\n{json.dumps(scores_arr_unfrozen, ensure_ascii=False)}\n```\n\n"
-        "请输出新的**仅包含未冻结及新增 id**的完整需求清单（使用 ```json``` 包裹，不含解释文本）："
+        "请输出新的仅含未冻结及新增 id 的完整需求清单（包裹为 ```json```）："
     )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
     resp = llm.invoke(messages)
     unfrozen_new_list = extract_first_json(resp.content)
-    record_llm_interaction(
-        state,
-        agent="ReqExplore",
-        iteration=state["iteration"],
-        messages=messages,
-        raw_output=resp.content,
-        parsed_output=unfrozen_new_list,
-    )
+    record_llm_interaction(state, agent="ReqExplore", iteration=state["iteration"],
+                           messages=messages, raw_output=resp.content, parsed_output=unfrozen_new_list)
 
-    # ===== 合并：冻结项强制回填 + 顺序稳定化 =====
-    # 1) 便于查找
+    # 合并：冻结项强制回填 + 顺序稳定化
     new_map: Dict[str, str] = {str(it["id"]): str(it["content"]) for it in unfrozen_new_list}
     prev_ids_order = [str(it["id"]) for it in state["req_list"]]
 
     merged: List[Dict[str, str]] = []
     for rid in prev_ids_order:
         if rid in frozen_ids_set:
-            # 冻结项：严格使用冻结版本
-            content = state["frozen_reqs"].get(
-                rid,
-                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
-            )
+            content = state["frozen_reqs"].get(rid,
+                      next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
         else:
-            # 未冻结项：若 LLM 提供了新版，用新版；否则沿用旧版
-            content = new_map.get(
-                rid,
-                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
-            )
+            content = new_map.get(rid,
+                      next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
         merged.append({"id": rid, "content": content})
 
-    # 2) 追加 LLM 新增的 id（保持模型扩展）
     for rid, content in new_map.items():
         if rid not in prev_ids_order:
             merged.append({"id": rid, "content": content})
 
     state["req_list"] = merged
-
     log(f"ReqExplore：完成合并，共 {len(state['req_list'])} 条；冻结 {len(state['frozen_ids'])} 条（未参与优化）")
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
-    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮最高分
-    - Clarify 的评分立场代表需求方诉求，明确与基准 SRS 的一致性/偏差与取舍建议。
-    """
+    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮最高分"""
     llm = llm or get_llm()
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
-
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
     frozen_ids_set = set(state['frozen_ids'])
 
-    # 仅选择未冻结条目参与评价
     unfrozen_list = [item for item in state["req_list"] if item["id"] not in frozen_ids_set]
     if not unfrozen_list:
         log("ReqClarify：所有需求均已冻结，本轮跳过评分")
@@ -390,16 +326,13 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         state["iteration"] += 1
         return state
 
-    # 评分策略文本（仅面向 ReqClarify）
     policy_text_clarify = score_policy_text("clarify")
-
     system = (
-        '你是"需求澄清智能体（ReqClarify）"，以提出需求的用户/需求方视角对需求清单逐项评分，'
-        '基准 SRS 代表需求方的诉求与底线，评分需以其为裁决依据。\n\n'
+        '你是"需求澄清智能体（ReqClarify）"，以需求方立场对需求清单逐项评分；'
+        '基准 SRS 是需求方诉求与底线，评分以其为依据。\n\n'
         f"{policy_text_clarify}\n\n"
-        "评分标准：+2、+1、0、-1、-2（见上）。\n"
-        "输出格式为 ```json\n[{\"id\": \"FR-01\", \"score\": 1, \"reason\": \"...\"}]\n```，"
-        "其中 reason 可省略但需简洁、基于基准 SRS 的对照。"
+        "评分标准：+2、+1、0、-1、-2；输出 ```json\n[{\"id\":\"FR-01\",\"score\":1,\"reason\":\"...\"}]\n```。"
+        "reason 可省略但应基于基准 SRS。"
     )
     user = (
         "需评分（未冻结）需求清单：\n"
@@ -410,22 +343,12 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         "```\n\n"
         "请输出评分 JSON 数组（使用 ```json``` 包裹）："
     )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
+    messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
     resp = llm.invoke(messages)
     evaluations = extract_first_json(resp.content)
-    record_llm_interaction(
-        state,
-        agent="ReqClarify",
-        iteration=state["iteration"],
-        messages=messages,
-        raw_output=resp.content,
-        parsed_output=evaluations,
-    )
+    record_llm_interaction(state, agent="ReqClarify", iteration=state["iteration"],
+                           messages=messages, raw_output=resp.content, parsed_output=evaluations)
 
-    # 仅保留分数供 ReqExplore 使用
     scores_map: Dict[str, int] = {}
     for item in evaluations:
         rid = str(item.get("id"))
@@ -433,7 +356,6 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         scores_map[rid] = sc
     state["scores"] = scores_map
 
-    # 将“本轮最高分”的需求冻结（加入 frozen_ids / frozen_reqs）
     if scores_map:
         max_score = max(scores_map.values())
         top_ids = [rid for rid, sc in scores_map.items() if sc == max_score]
@@ -460,44 +382,60 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
     system = (
         '你是"文档生成智能体（DocGenerate）"，将优化后的需求清单转化为符合 IEEE 29148-2018 的 SRS。\n'
-        '必须保留原始 id；按 FR/NFR/CON 分组；语言正式、无二义；\n'
-        '确保每条需求具备：触发条件→执行逻辑→结果输出→异常兜底。'
+        '必须保留原始 id；按 FR/NFR/CON 分组；语言正式、无二义；'
+        '每条需求具备：触发条件→执行逻辑→结果输出→异常兜底。'
     )
     user = (
         "最终需求清单（JSON 数组）：\n"
         f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
         "请输出 Markdown 版本 SRS："
     )
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    
-    # 记录输入日志
-    record_llm_interaction(
-        state,
-        agent="DocGenerate",
-        iteration=state["iteration"],
-        messages=messages,
-        raw_output=None,
-    )
-    
+    messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
+
+    record_llm_interaction(state, agent="DocGenerate", iteration=state["iteration"],
+                           messages=messages, raw_output=None)
+
     print("\n====== 实时 Markdown SRS 输出（流式） ======\n", flush=True)
     resp = llm.invoke(messages)
     print("\n====== 流式输出结束 ======\n", flush=True)
+
     raw_content = resp.content
-    if isinstance(raw_content, str):
-        full_text = raw_content
-    elif isinstance(raw_content, list):
-        full_text = "".join(str(part) for part in raw_content)
-    else:
-        full_text = str(raw_content) if raw_content is not None else ""
+    full_text = raw_content if isinstance(raw_content, str) else \
+                ("".join(str(part) for part in raw_content) if isinstance(raw_content, list) else str(raw_content) or "")
     if not full_text:
         full_text = stream_handler.get_text()
-    
+
     state["srs_output"] = full_text
     state["srs_stream_printed"] = True
     log("DocGenerate：流式输出完成")
+    return state
+
+
+def sim_evaluate_node(state: GraphState) -> GraphState:
+    """SimEvaluate：使用嵌入（不分片）计算生成文档与基准 SRS 的相似度并打印"""
+    log("SimEvaluate：开始计算生成文档与基准 SRS 的文本嵌入相似度（不分片）")
+    if not state.get("srs_output"):
+        log("SimEvaluate：未检测到生成文档内容（srs_output 为空），跳过相似度计算")
+        state["embedding_similarity"] = None
+        state["embedding_distance"] = None
+        return state
+
+    try:
+        emb = get_embeddings_model()
+        vec_gen = emb.embed_query(state["srs_output"])
+        vec_ref = emb.embed_query(state["reference_srs"])
+        sim = cosine_similarity(vec_gen, vec_ref)
+        dist = 1.0 - sim
+        state["embedding_similarity"] = sim
+        state["embedding_distance"] = dist
+        print(f"\n====== 文档与基准 SRS 的嵌入相似度（SimEvaluate） ======\n"
+              f"Cosine Similarity : {sim:.6f}\n"
+              f"Distance (1 - cos): {dist:.6f}\n", flush=True)
+        log(f"SimEvaluate：相似度={sim:.6f}，距离={dist:.6f}")
+    except Exception as e:
+        state["embedding_similarity"] = None
+        state["embedding_distance"] = None
+        log(f"SimEvaluate：计算嵌入相似度失败：{e}")
     return state
 
 
@@ -505,9 +443,7 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 # 条件路由：是否继续迭代
 # -----------------------------
 def should_continue(state: GraphState) -> str:
-    """
-    达到最大迭代轮数后结束，否则继续。
-    """
+    """达到最大迭代轮数后结束，否则继续。"""
     if state["iteration"] > state["max_iterations"]:
         log("条件判断：达到最大迭代次数，进入文档生成")
         return "DocGenerate"
@@ -524,6 +460,7 @@ def build_graph():
     graph.add_node("ReqExplore", req_explore_node)
     graph.add_node("ReqClarify", req_clarify_node)
     graph.add_node("DocGenerate", doc_generate_node)
+    graph.add_node("SimEvaluate", sim_evaluate_node)  # 新增相似度节点
 
     graph.set_entry_point("ReqParse")
     graph.add_edge("ReqParse", "ReqExplore")
@@ -532,7 +469,8 @@ def build_graph():
         "ReqExplore": "ReqExplore",
         "DocGenerate": "DocGenerate"
     })
-    graph.add_edge("DocGenerate", END)
+    graph.add_edge("DocGenerate", "SimEvaluate")  # 文档生成后进入相似度评估
+    graph.add_edge("SimEvaluate", END)
     return graph.compile()
 
 
@@ -558,9 +496,12 @@ def run_demo(demo: DemoInput):
         "max_iterations": demo.max_iterations,
         "srs_output": "",
         "srs_stream_printed": False,
-        # 冻结机制初始态
+        # 冻结机制
         "frozen_ids": [],
         "frozen_reqs": {},
+        # 相似度初始态
+        "embedding_similarity": None,
+        "embedding_distance": None,
     }
     final_state = app.invoke(init)
     log("流程结束，输出结果")
@@ -569,6 +510,12 @@ def run_demo(demo: DemoInput):
     else:
         print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
         print(final_state["srs_output"], flush=True)
+
+    # 可选：在流程末尾再次摘要相似度（SimEvaluate 已打印过，这里仅回显）
+    sim = final_state.get("embedding_similarity", None)
+    dist = final_state.get("embedding_distance", None)
+    if sim is not None and dist is not None:
+        print(f"（摘要）Cosine Similarity : {sim:.6f} | Distance : {dist:.6f}\n", flush=True)
 
 
 # -----------------------------
@@ -588,29 +535,10 @@ DEFAULT_REFERENCE_SRS = (
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="LangGraph 多智能体 SRS 生成演示脚本"
-    )
-    parser.add_argument(
-        "-u",
-        "--user-input",
-        type=str,
-        help="用户需求文本文件路径（user_input）",
-    )
-    parser.add_argument(
-        "-r",
-        "--reference-srs",
-        type=str,
-        help="参考 SRS 文本文件路径（reference_srs）",
-    )
-    parser.add_argument(
-        "-m",
-        "--max-iterations",
-        type=int,
-        default=2,
-        help="最大迭代轮数，默认 5",
-    )
-
+    parser = argparse.ArgumentParser(description="LangGraph 多智能体 SRS 生成演示脚本")
+    parser.add_argument("-u", "--user-input", type=str, help="用户需求文本文件路径（user_input）")
+    parser.add_argument("-r", "--reference-srs", type=str, help="参考 SRS 文本文件路径（reference_srs）")
+    parser.add_argument("-m", "--max-iterations", type=int, default=2, help="最大迭代轮数，默认 5")
     args = parser.parse_args()
 
     if bool(args.user_input) ^ bool(args.reference_srs):
@@ -623,11 +551,7 @@ def main() -> None:
         user_input_text = DEFAULT_USER_INPUT
         reference_srs_text = DEFAULT_REFERENCE_SRS
 
-    demo = DemoInput(
-        user_input=user_input_text,
-        reference_srs=reference_srs_text,
-        max_iterations=args.max_iterations,
-    )
+    demo = DemoInput(user_input=user_input_text, reference_srs=reference_srs_text, max_iterations=args.max_iterations)
     if not args.user_input:
         log("未提供参数，使用内置示例场景")
     run_demo(demo)
