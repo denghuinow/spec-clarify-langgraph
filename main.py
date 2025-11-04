@@ -7,9 +7,10 @@ Multi-Agent SRS Generation with LangGraph
 - ReqExplore：仅基于分数优化，输出完整新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
 
-本版本新增能力：
-1) 最高分需求项“冻结暂存”，不再重复评价；
-2) 在 ReqExplore 阶段严格保持冻结项“内容不变、不可删除/重命名”，并在输出后进行强制回填校验；
+本版本新增/修订能力：
+1) “最高分需求项冻结暂存”，不再重复评价；
+2) 冻结项在 ReqExplore 阶段**不再交由迭代优化**（只读参考，不进入待优化输入）；
+3) 对 LLM 输出执行“冻结项强制回填 + 顺序稳定化”，确保冻结项内容与存在性不变。
 """
 
 from __future__ import annotations
@@ -155,8 +156,8 @@ class GraphState(TypedDict):
     clarification_memory: Dict[str, str]  # {id: clarification_request}
     pending_clarifications: List[Dict[str, Any]]  # 存储待澄清的需求
 
-    # ===== 新增：冻结机制 =====
-    frozen_ids: List[str]            # 本轮及历史上被“最高分”选中的需求 id（不再评分）
+    # ===== 冻结机制 =====
+    frozen_ids: List[str]            # 被“最高分”选中的需求 id（不再评分/不再交给 ReqExplore）
     frozen_reqs: Dict[str, str]      # id -> content（冻结版本内容，ReqExplore 不得修改）
 
 
@@ -219,196 +220,146 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
-    """ReqExplore：根据逐条评分（+2~−2）优化，输出"新的完整需求清单"（无 action 字段）"""
+    """ReqExplore：根据逐条评分（+2~−2）优化，输出新的完整需求清单（不再处理冻结项）"""
     llm = llm or get_llm()
-    log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单")
+    log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单（冻结项不参与）")
     
-    # 初始化记忆和待澄清列表
-    if 'clarification_memory' not in state:
-        state['clarification_memory'] = {}
-    if 'pending_clarifications' not in state:
-        state['pending_clarifications'] = []
-    if 'frozen_ids' not in state:
-        state['frozen_ids'] = []
-    if 'frozen_reqs' not in state:
-        state['frozen_reqs'] = {}
-    
-    # 将评分 dict 映射为数组，便于展示
-    scores_arr = [{"id": rid, "score": sc} for rid, sc in state.get("scores", {}).items()]
+    # 初始化集合
+    state.setdefault('clarification_memory', {})
+    state.setdefault('pending_clarifications', [])
+    state.setdefault('frozen_ids', [])
+    state.setdefault('frozen_reqs', {})
 
-    # 如果有评分，根据评分处理澄清
-    if scores_arr:
-        # 处理澄清结果，更新澄清记忆
-        for score_item in scores_arr:
-            req_id = score_item["id"]
-            score = score_item["score"]
-            # 如果评分较低（-1 或 -2），可能需要重新处理该需求
-            if score <= -1 and req_id in state['clarification_memory']:
-                # 从澄清记忆中移除已处理的需求
-                del state['clarification_memory'][req_id]
+    frozen_ids_set = set(state['frozen_ids'])
+
+    # 仅保留“未冻结”的评分传给提示
+    scores_arr_unfrozen = [
+        {"id": rid, "score": sc}
+        for rid, sc in state.get("scores", {}).items()
+        if rid not in frozen_ids_set
+    ]
+
+    # “待优化清单”：仅未冻结项
+    unfrozen_list = [it for it in state['req_list'] if it['id'] not in frozen_ids_set]
+
+    # 若无未冻结项，直接跳过模型调用
+    if not unfrozen_list:
+        log("ReqExplore：无未冻结需求，跳过模型调用，需求清单保持不变")
+        return state
     
-    # 提取当前需求清单中的澄清请求并转换为假设性补全
+    # 根据评分处理澄清记忆（仅考虑未冻结项）
+    for score_item in scores_arr_unfrozen:
+        req_id = score_item["id"]
+        score = score_item["score"]
+        if score <= -1 and req_id in state['clarification_memory']:
+            del state['clarification_memory'][req_id]
+    
+    # 从未冻结条目里提取(待澄清: ...)
     current_clarifications = []
-    for req in state['req_list']:
+    for req in unfrozen_list:
         content = req['content']
-        # 提取(待澄清: ...)内容并转换为假设性补全
-        clarification_matches = re.findall(r'\(待澄清: (.*?)\)', content)
-        for match in clarification_matches:
+        for match in re.findall(r'\(待澄清: (.*?)\)', content):
             current_clarifications.append({
                 "id": req['id'],
                 "content": match,
                 "original_content": content
             })
-    
-    # 更新澄清记忆
     for clarification in current_clarifications:
         state['clarification_memory'][clarification['id']] = clarification['content']
         state['pending_clarifications'].append(clarification)
 
-    # ===== 新增：将冻结集合传入系统提示，明确“不得修改/删除/重命名” =====
+    # 冻结只读清单（用于上下文一致性，但不进入待优化输入）
     frozen_payload = [
         {"id": fid, "content": state["frozen_reqs"].get(fid, "")}
         for fid in state["frozen_ids"]
     ]
 
     system = (
-        '你是"需求挖掘智能体（ReqExplore）"，同时充当资深软件需求分析师兼系统逻辑闭环专家，专门协助开发人员将草稿级功能需求转化为结构完整、逻辑严密、可执行落地的正式文档。\n\n'
-        
-        '## 核心职责\n'
-        '1. 逐条解析原始需求，识别功能点、触发条件、输入输出、状态流转、依赖关系与边界情况\n'
-        '2. 在不改变原意前提下，主动补全缺失细节，直接输出完整的需求描述：\n'
-        '   - 权限控制规则（谁？在什么条件下？）\n'
-        '   - 异常处理路径（失败/超时/冲突/无权限反馈机制）\n'
-        '   - 数据一致性机制（同步策略、冲突解决、幂等性）\n'
-        '   - 状态机定义（状态变更、回退/撤销机制）\n'
-        '   - 用户反馈机制（成功/失败提示、前端交互）\n'
-        '3. 确保每条需求形成完整闭环，包含：触发条件 → 执行逻辑 → 结果输出 → 异常兜底\n'
-        '4. 覆盖正向流程 + 逆向流程（删除/撤回/驳回/重试）\n'
-        '5. 确保数据来源 → 数据处理 → 数据消费 → 数据归档/同步的完整链路\n'
-        '6. 遇到模糊、矛盾、缺失、歧义内容，应直接提出明确的完整需求，而非提出问题或建议补全\n\n'
-        
-        '## 冻结清单（只读）\n'
+        '你是"需求挖掘智能体（ReqExplore）"，负责在保持格式/编号稳定的前提下，对“待优化清单（仅未冻结项）”进行闭环补全与优化。\n\n'
+        '## 只读冻结清单\n'
         f'{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else "无"}\n'
-        ' - 上述“冻结”条目禁止任何修改、删除或重命名，必须原样出现在最终 JSON 数组里。\n\n'
-        
-        '## 记忆机制\n'
-        '1. 你有澄清记忆，记录了之前识别出的待澄清项：\n'
-        f'{json.dumps(state["clarification_memory"], ensure_ascii=False, indent=2) if state["clarification_memory"] else "无"}\n'
-        '2. 对于澄清记忆中的项目，应基于上下文直接输出明确的完整需求\n'
-        '3. 评分含义：\n'
-        '   - +2 强采纳：保持原需求并精炼，假设性补全被验证为正确\n'
-        '   - +1 采纳：保留并细化，假设性补全基本正确\n'
-        '   - 0 中性：保持或泛化，可能需要调整假设性补全\n'
-        '   - -1 不采纳：需重写或替换，假设性补全需要调整\n'
-        '   - -2 强不采纳：删除或替代，假设性补全需要重新考虑\n\n'
-        
+        ' - 冻结清单**只读**，你不得输出或修改这些 id；最终结果会由系统自动合并。\n\n'
+        '## 输出范围\n'
+        ' - 仅针对“待优化清单”中的 id（未冻结）进行修改/细化；\n'
+        ' - 如需新增条目，可新增连续编号的新 id；\n'
+        ' - **禁止**输出冻结 id；**禁止**变更任何冻结项内容或编号。\n\n'
         '## 输出规范（直接输出完整需求）\n'
-        '1. 格式一致性原则（最高优先级）：\n'
-        '   - 最终输出的标题层级、编号体系、段落缩进、列表符号、术语风格必须与原始需求内容100%一致\n'
-        '   - 禁止重构文档结构、更改编号或标题层级、添加原始文档未使用的格式\n'
-        '2. 输出格式：\n'
-        '   - 直接输出完整的、明确的需求描述，不使用任何标记如(建议补全: ...)或(待澄清: ...)\n'
-        '   - 将所有必要的细节直接整合到需求内容中\n'
-        '3. 绝对禁止使用任何补全标记或问题标记\n\n'
-        
-        '## 自检清单（输出前必查）\n'
-        ' - [ ] 所有操作是否有明确权限控制？\n'
-        ' - [ ] 所有外部依赖是否有失败处理？\n'
-        ' - [ ] 所有"支持XXX"是否定义输入、输出、异常？\n'
-        ' - [ ] 所有自动行为是否定义触发条件、频率、失败策略？\n'
-        ' - [ ] 所有列表是否定义默认排序、分页、检索字段？\n'
-        ' - [ ] 所有状态变更是否有对应事件或回调？\n'
-        ' - [ ] 格式是否与原始需求内容完全一致？\n'
-        ' - [ ] 是否避免了使用任何补全或问题标记？\n\n'
-        
-        '## 最终目标\n'
-        '交付一份满足以下标准的功能规格文档：\n'
-        ' - 逻辑无漏洞\n'
-        ' - 权限无越界\n'
-        ' - 数据无断点\n'
-        ' - 交互无盲区\n'
-        ' - 格式零偏差（与原始内容完全一致）\n'
-        ' - 所有需求都是明确、完整、可执行的\n\n'
-        
-        '请严格按照上述规范，结合评分结果和澄清记忆生成新的完整需求清单。'
-        '直接输出完整的、明确的需求描述，不要使用任何标记格式。'
-        '严禁输出澄清条目的任何解释性文本或表格，只能返回 ```json\n[{"id": "FR-01", "content": "完整的需求描述"}]\n``` 形式的 JSON 数组。'
-        '若删除条目请移除该 id；若新增条目请分配连续的新 id，并保持既有编号稳定。'
+        ' - 保持与输入相同的标题/编号/术语风格；\n'
+        ' - 输出闭环需求：触发条件 → 执行逻辑 → 结果输出 → 异常兜底；\n'
+        ' - 输出为 ```json\n[{"id": "FR-01", "content": "..."}]\n```；仅包含待优化 id 和新增 id；\n'
+        ' - 禁止出现(建议补全: ...)/(待澄清: ...)等标记。\n'
     )
     user = (
-        "上一轮需求清单（JSON 数组）：\n"
-        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
-        "逐条评分结果（JSON 数组，来自 ReqClarify）：\n"
-        f"```json\n{json.dumps(scores_arr, ensure_ascii=False)}\n```\n\n"
-        "请输出新的完整需求清单（仅 JSON 数组，使用 ```json``` 包裹，不含任何解释文本）："
+        "待优化清单（仅未冻结项，JSON 数组）：\n"
+        f"```json\n{json.dumps(unfrozen_list, ensure_ascii=False)}\n```\n\n"
+        "逐条评分结果（仅未冻结项）：\n"
+        f"```json\n{json.dumps(scores_arr_unfrozen, ensure_ascii=False)}\n```\n\n"
+        "请输出新的**仅包含未冻结及新增 id**的完整需求清单（使用 ```json``` 包裹，不含解释文本）："
     )
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
     resp = llm.invoke(messages)
-    new_list = extract_first_json(resp.content)
+    unfrozen_new_list = extract_first_json(resp.content)
     record_llm_interaction(
         state,
         agent="ReqExplore",
         iteration=state["iteration"],
         messages=messages,
         raw_output=resp.content,
-        parsed_output=new_list,
+        parsed_output=unfrozen_new_list,
     )
 
-    # ===== 新增：对 LLM 输出进行“冻结项强制回填 + 顺序稳定化”处理 =====
-    # 构建 id->content 映射
-    new_map: Dict[str, str] = {str(item["id"]): str(item["content"]) for item in new_list}
-    prev_ids_order = [str(item["id"]) for item in state["req_list"]]
+    # ===== 合并：冻结项强制回填 + 顺序稳定化 =====
+    # 1) 便于查找
+    new_map: Dict[str, str] = {str(it["id"]): str(it["content"]) for it in unfrozen_new_list}
+    prev_ids_order = [str(it["id"]) for it in state["req_list"]]
 
-    # 以上一轮顺序为基线，融合新内容；对冻结 id 强制回填冻结内容
     merged: List[Dict[str, str]] = []
     for rid in prev_ids_order:
-        # 从新输出拿内容，否则保留旧内容
-        content = new_map.get(
-            rid,
-            next((it["content"] for it in state["req_list"] if it["id"] == rid), "")
-        )
-        # 冻结覆盖（保证不被修改/删除）
-        if rid in state["frozen_ids"]:
-            content = state["frozen_reqs"].get(rid, content)
+        if rid in frozen_ids_set:
+            # 冻结项：严格使用冻结版本
+            content = state["frozen_reqs"].get(rid, next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
+        else:
+            # 未冻结项：若 LLM 提供了新版，用新版；否则沿用旧版
+            content = new_map.get(rid, next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
         merged.append({"id": rid, "content": content})
 
-    # 追加新出现的 id（保持模型新增）
+    # 2) 追加 LLM 新增的 id（保持模型扩展）
     for rid, content in new_map.items():
         if rid not in prev_ids_order:
             merged.append({"id": rid, "content": content})
 
-    # 更新需求列表
     state["req_list"] = merged
-    
-    # 清理已处理的澄清项（基于评分结果）
-    if scores_arr:
-        processed_ids = {item["id"] for item in scores_arr}
+
+    # 3) 清理 pending_clarifications（仅根据未冻结项评分）
+    if scores_arr_unfrozen:
+        processed_ids = {item["id"] for item in scores_arr_unfrozen}
         state['pending_clarifications'] = [
-            item for item in state['pending_clarifications'] 
+            item for item in state['pending_clarifications']
             if item['id'] not in processed_ids or item['id'] in state['clarification_memory']
         ]
     
-    log(f"ReqExplore：生成新的需求清单，共 {len(state['req_list'])} 条（冻结 {len(state['frozen_ids'])}）")
+    log(f"ReqExplore：完成合并，共 {len(state['req_list'])} 条；冻结 {len(state['frozen_ids'])} 条（未参与优化）")
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     """ReqClarify：对每条需求逐项评分，并记录简要理由（不传递给下游）
-
-    本版本改造：
     - 仅对“未冻结”的需求进行评分；
-    - 本轮评分结束后，自动将“最高分”的需求加入冻结集合，后续不再参与评分；
+    - 本轮评分结束后，将“最高分”的需求加入冻结集合，后续不再参与评分与优化；
     """
     llm = llm or get_llm()
-    log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分")
+    log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
+
+    state.setdefault('frozen_ids', [])
+    state.setdefault('frozen_reqs', {})
+    frozen_ids_set = set(state['frozen_ids'])
 
     # 仅选择未冻结条目参与评价
-    unfrozen_list = [item for item in state["req_list"] if item["id"] not in state.get("frozen_ids", [])]
+    unfrozen_list = [item for item in state["req_list"] if item["id"] not in frozen_ids_set]
     if not unfrozen_list:
-        # 无需调用 LLM；直接推进迭代轮次
         log("ReqClarify：所有需求均已冻结，本轮跳过评分")
         state["scores"] = {}
         state["iteration"] += 1
@@ -416,33 +367,11 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
 
     system = (
         '你是"需求澄清智能体（ReqClarify）"，模拟提出需求的用户，负责对生成的需求清单进行评分。\n\n'
-        
-        '## 核心职责\n'
-        '1. 以用户视角评估需求清单中的每项需求\n'
-        '2. 对比基准SRS文档，判断需求是否符合预期\n'
-        '3. 基于业务需要和基准SRS内容对需求进行评分\n'
-        '4. 重点关注需求是否满足业务目标和功能要求\n\n'
-        
-        '## 评分标准\n'
-        ' - +2 强采纳：需求完全符合基准SRS要求，超出预期，非常满意\n'
-        ' - +1 采纳：需求基本符合基准SRS要求，略有改进，满意\n'
-        ' - 0 中性：需求与基准SRS要求基本一致，无明显改进或问题\n'
-        ' - -1 不采纳：需求与基准SRS要求有偏差，需要调整\n'
-        ' - -2 强不采纳：需求严重偏离基准SRS要求，完全不符合预期\n\n'
-        
-        '## 评估依据\n'
-        ' - [ ] 需求是否符合基准SRS中的功能要求？\n'
-        ' - [ ] 需求是否满足业务目标？\n'
-        ' - [ ] 需求是否与基准SRS中的非功能要求一致？\n'
-        ' - [ ] 需求是否体现了基准SRS中的约束条件？\n'
-        ' - [ ] 需求是否与基准SRS中的总体目标相符？\n\n'
-        
-        '## 输出规范\n'
-        '请输出 ```json\n[{"id": "FR-01", "score": 1, "reason": "..."}]\n``` 形式的 JSON 数组，'
-        '其中 reason 可省略但需简洁，重点说明与基准SRS的对比结果和评分依据。'
+        '评分标准：+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳。\n'
+        '输出 ```json\n[{"id": "FR-01", "score": 1, "reason": "..."}]\n```。reason 可省略但需简洁。'
     )
     user = (
-        "需评分的未冻结需求清单：\n"
+        "需评分（未冻结）需求清单：\n"
         f"```json\n{json.dumps(unfrozen_list, ensure_ascii=False)}\n```\n\n"
         "基准 SRS：\n"
         "```text\n"
@@ -473,11 +402,10 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         scores_map[rid] = sc
     state["scores"] = scores_map
 
-    # ===== 新增：将“本轮最高分”的需求冻结（加入 frozen_ids / frozen_reqs），避免后续重复评价 =====
+    # 将“本轮最高分”的需求冻结（加入 frozen_ids / frozen_reqs）
     if scores_map:
         max_score = max(scores_map.values())
         top_ids = [rid for rid, sc in scores_map.items() if sc == max_score]
-        # 建立 req_list 查找表
         req_map = {str(it["id"]): str(it["content"]) for it in state["req_list"]}
         added = 0
         for rid in top_ids:
@@ -489,7 +417,7 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     else:
         log("ReqClarify：本轮无评分结果，未新增冻结项")
 
-    log("ReqClarify：评分记录完成（未冻结项）")
+    log("ReqClarify：评分记录完成（仅未冻结项）")
     state["iteration"] += 1
     return state
 
@@ -500,38 +428,9 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     stream_handler = StreamingPrinter()
     llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
     system = (
-        '你是"文档生成智能体（DocGenerate）"，专门将经过逻辑闭环完善的需求清单转化为符合 IEEE 29148-2018 标准的正式SRS文档。\n\n'
-        
-        '## 核心职责\n'
-        '1. 将最终需求清单（包含(建议补全)和(待澄清)标识的完整需求）转化为结构化的SRS文档\n'
-        '2. 保持需求的原始编号和ID，确保可追溯性\n'
-        '3. 按照IEEE 29148-2018标准组织文档结构，确保逻辑清晰\n'
-        '4. 将(建议补全)和(待澄清)内容整合为正式的需求表述\n\n'
-        
-        '## 文档结构要求\n'
-        '必须包含以下章节：\n'
-        '1. 引言（目的、范围、定义、参考资料、文档概述）\n'
-        '2. 总体描述（产品概述、产品功能、用户特点、约束、假设和依赖）\n'
-        '3. 详细需求说明：\n'
-        '   3.1 功能需求（FR-XX系列）\n'
-        '   3.2 非功能需求（NFR-XX系列）\n'
-        '   3.3 约束（CON-XX系列）\n'
-        '4. 附录（如需要）\n\n'
-        
-        '## 输出规范\n'
-        '1. 最终需求清单的结构为 ```json\n[{"id": "FR-01", "content": "..."}]\n```，其中 id 前缀（FR/NFR/CON）标识类别\n'
-        '2. 根据 id 前缀分组列出需求，沿用原始 id，语言正式、无二义\n'
-        '3. 将(建议补全: 内容...)和(待澄清: 问题...)整合为完整、正式的需求描述\n'
-        '4. 确保每条需求都具备完整的触发条件→执行逻辑→结果输出→异常兜底的闭环描述\n'
-        '5. 只输出 Markdown 文档，格式清晰易读\n\n'
-        
-        '## 质量要求\n'
-        ' - 结构性：严格遵循IEEE 29148-2018标准结构\n'
-        ' - 完整性：包含所有经过优化的需求项\n'
-        ' - 一致性：保持原始ID和编号体系\n'
-        ' - 正式性：语言正式、逻辑清晰、无歧义\n\n'
-        
-        '请严格按照上述规范生成SRS文档。'
+        '你是"文档生成智能体（DocGenerate）"，将优化后的需求清单转化为符合 IEEE 29148-2018 的 SRS。\n'
+        '必须保留原始 id；按 FR/NFR/CON 分组；语言正式、无二义；\n'
+        '确保每条需求具备：触发条件→执行逻辑→结果输出→异常兜底。'
     )
     user = (
         "最终需求清单（JSON 数组）：\n"
@@ -565,7 +464,6 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     if not full_text:
         full_text = stream_handler.get_text()
     
-    # 更新日志记录，避免重复
     state["srs_output"] = full_text
     state["srs_stream_printed"] = True
     log("DocGenerate：流式输出完成")
@@ -631,7 +529,7 @@ def run_demo(demo: DemoInput):
         "srs_stream_printed": False,
         "clarification_memory": {},
         "pending_clarifications": [],
-        # ===== 新增：冻结机制初始态 =====
+        # 冻结机制初始态
         "frozen_ids": [],
         "frozen_reqs": {},
     }
