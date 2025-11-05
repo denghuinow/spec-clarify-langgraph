@@ -109,7 +109,7 @@ class StreamingPrinter(BaseCallbackHandler):
 # -----------------------------
 def get_llm(
     model: str = None,
-    temperature: float = 0.2,
+    temperature: float = 0.7,
     streaming: bool = False,
     callbacks: Optional[List[Any]] = None,
 ):
@@ -199,22 +199,50 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     llm = llm or get_llm()
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
+
+    # === 提示词升级（原子化拆分 / 术语锚定 / 判别启发）===
     system = (
-        '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为结构化初始清单。\n\n'
-        '【需求编号规范】\n'
-        '- 功能需求（Functional Requirements）：FR-01, FR-02, FR-03, ...（从01开始，连续递增，使用两位数字）\n'
-        '- 非功能需求（Non-Functional Requirements）：NFR-01, NFR-02, NFR-03, ...（从01开始，连续递增）\n'
-        '- 约束（Constraints）：CON-01, CON-02, CON-03, ...（从01开始，连续递增）\n'
-        '- 编号格式：前缀（FR/NFR/CON）- 两位数字（01-99），编号必须连续且唯一\n\n'
-        '输出规范：```json\n[{"id": "FR-01", "content": "..."}]\n```（仅 id 与 content）。\n'
-        '不得引入占位或问题标记；保持原术语与风格一致；严格按照上述编号规范分配 id。'
+        '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为**原子化**的初始清单。\n'
+        '\n'
+        '【解析方法（在内部完成，不要出现在输出中）】\n'
+        '1) 识别三元组：<角色/Actor, 动作/Action, 客体/Object>，并映射到业务对象（如 用户/管理员/系统/外部服务）。\n'
+        '2) 原子化拆分：一条需求仅描述**单一可验证行为或约束**；遇到“且/并且/以及/或/同时”等连接词，必要时拆分为多条。\n'
+        '3) 去重与同义合并：合并等义表述，统一术语与量纲；避免重复。\n'
+        '4) 分类判别（启发式）：\n'
+        '   • FR-*（功能）：描述输入→处理→输出的可观察行为或接口交互。\n'
+        '   • NFR-*（非功能）：性能/容量（吞吐/并发/响应时延/峰值）、可靠性/可用性、可维护性、可移植性、\n'
+        '     安全（鉴权/审计/最小权限/加密/合规）、可观测性（日志/指标/追踪）。\n'
+        '   • CON-*（约束）：法律/合规/组织策略/平台边界/外部依赖/数据主权/部署与网络限制等不以功能体验为主的**强约束**。\n'
+        '5) 术语锚定：\n'
+        '   • 保留用户输入中的专有名词与单位；禁止发明新术语；如需补足名词，使用“前提：…”嵌入到 content 末尾。\n'
+        '6) 质量门槛：避免“可能/尽量/适当/TBD/？”等模糊词；可测试、可追踪；禁止问题式/澄清式输出。\n'
+        '\n'
+        '【编号规范】\n'
+        '- 功能需求：FR-01, FR-02, FR-03, ...（两位数字递增，起始01，连续且唯一）\n'
+        '- 非功能需求：NFR-01, NFR-02, ...（两位数字递增）\n'
+        '- 约束：CON-01, CON-02, ...（两位数字递增）\n'
+        '编号不得跳号或重复；三类序列相互独立。\n'
+        '\n'
+        '【输出格式（仅 JSON 数组，元素字段仅含 id 与 content）】\n'
+        '```json\n'
+        '[{"id":"FR-01","content":"……"}]\n'
+        '```\n'
+        '不得出现除 id、content 之外的字段；不得输出解释、表格或注释。\n'
     )
-    user = f"用户需求：\n{state['user_input']}\n\n请仅输出结构化 JSON 数组，外层用 ```json``` 包裹。"
-    messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
+
+    user = (
+        "用户需求：\n"
+        f"{state['user_input']}\n\n"
+        "请仅输出结构化 JSON 数组（外层使用 ```json 围栏，数组元素仅含 id 与 content）。"
+    )
+
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
     resp = llm.invoke(messages)
     parsed = extract_first_json(resp.content)
-    record_llm_interaction(state, agent="ReqParse", iteration=current_iteration,
-                           messages=messages, raw_output=resp.content, parsed_output=parsed)
+    record_llm_interaction(
+        state, agent="ReqParse", iteration=current_iteration,
+        messages=messages, raw_output=resp.content, parsed_output=parsed
+    )
     state["req_list"] = parsed
     state["iteration"] = current_iteration
     log(f"ReqParse：解析完成，共 {len(parsed)} 条需求")
@@ -247,8 +275,10 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
                       for fid in state["frozen_ids"]]
     removed_payload = [{"id": rid} for rid in state["removed_ids"]]
 
+    # === 提示词升级（闭环补全 / 近邻外推 / 边界控制 / JSON 严格）===
     system = f"""
-你是“需求挖掘智能体（ReqExplore）”，一名资深软件需求分析师与闭环设计专家。只对**未冻结且未被移除**的条目进行优化；冻结条目与已移除条目严禁修改，也不要出现在输出中（系统稍后合并）。
+你是“需求挖掘智能体（ReqExplore）”，资深需求工程师与闭环设计专家。只对**未冻结且未移除**的条目进行优化；
+冻结条目与已移除条目严禁修改，也不要出现在输出中（系统稍后合并）。
 
 【你将收到】
 - 未冻结条目清单（id, content）
@@ -256,30 +286,35 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
 - （只读）冻结清单
 - （只读）已移除清单（禁止复提/改写）
 
-【按分数采取动作（务必遵循）】
-+2（强采纳）：仅做表达精炼与条理化，不改变语义；不得新增条目。
-+1（采纳）：保留并**细化**缺失细节（输入/输出、权限与审计、异常与回退、数据一致性与幂等、状态机、可观测性）；可做轻量结构化；如确有必要，可近邻新增 1~2 条直接依赖的支撑项。
-0（中性）：**保持或泛化**，去除不确定假设，改为**条件化/可检验**表述；不得新增条目。
--1（不采纳）：在不扩张无关范围的前提下**重写或替换**，更贴合**用户期望与场景约束**；明确触发、失败与回退路径；可新增 ≤2 条近邻支撑项。
--2（强不采纳）：**从清单中剔除该 id**；不得新增替代条目；**禁止以 FR/NFR/CON/SUG 任意形式复提或近义改写**。
+【动作对照（严格遵循评分）】
++2（强采纳）：仅做文字精炼与条理化；**不新增**条目，不改变语义。
++1（采纳）：在**不改变意图**前提下补齐验证口径：输入/输出、权限与审计、异常与回退、数据一致性与幂等、
+             可观测性（日志/指标/追踪）；可进行轻量结构化；如确需支撑，可近邻新增 ≤2 条直接依赖项。
+0（中性）：保持或泛化表述，将不确定假设前置为“前提：…”，并转换为**可检验**表达；**不新增**条目。
+-1（不采纳）：在不扩张范围的前提下重写或替代，使之贴合**角色/触发/结果/失败策略/一致性**；可新增 ≤2 条近邻支撑项。
+-2（强不采纳）：**从清单中剔除该 id**；不得新增替代；且**禁止以 FR/NFR/CON/SUG 任意形式复提或近义改写**。
 
-【用户视角“近邻外推”（新增边界）】
-- 仅围绕现有意图的上下游必要步骤与合规/可靠/可观测性支撑；禁止跨域扩张。
-- 必要假设用“前提：…”显式化；禁止使用 TBD/？ 等占位。
+【闭环模板（建议融合到 content 内）】
+触发：…  输入：…  处理：…  输出：…  异常与回退：…  访问控制与审计：…  一致性与幂等：…  可观测性：…  前提：…
 
-【闭环模板（建议内嵌到 content）】
-- 触发：…  输入：…  处理：…  输出：…  异常与回退：…  可观测性：…  前提：…
+【近邻外推（新增边界）】
+- 仅围绕当前条目的必要上下游步骤与合规/可靠/可观测性支撑；禁止跨域扩张，不得引入新模块/新角色/新数据域。
+- “必要”判定：若缺失该支撑，将导致条目**不可验证或不可运行**。
+
+【术语与一致性】
+- 术语沿用既有清单与用户原文；单位/阈值/量纲要明确，不要含混词（如“快速”“较多”）。
+- 不发明新概念；必要假设用“前提：…”列出，勿用 TBD/？ 等占位。
 
 【编号与冲突】
 - 仅输出“未冻结 + 新增”条目；**不要**输出任何冻结或已移除条目。
-- 新增 FR/NFR/CON 在各自序列上顺延编号；SUG-xx 从 SUG-01 起；避免与现有 id 冲突。
-- 保持未冻结 id 的相对顺序稳定；避免与冻结或已移除条目语义冲突。
+- 新增条目编号：在各自序列（FR/NFR/CON/SUG）末尾顺延；避免与现有 id 冲突；保持未冻结 id 的相对顺序稳定。
+- 不得复提 removed_ids 中任何 id 或其近义改写。
 
 【自检清单】
-- 是否形成“触发→处理→输出→异常/回退→可观测性”的可验证闭环？
-- 是否删除模糊词并用“前提：…”显式化必要假设？
+- 是否形成“触发→处理→输出→异常/回退→访问控制/审计→一致性/幂等→可观测性→前提”的可验证闭环？
+- 是否删除模糊词并给出阈值/口径？是否显式列出“前提：…”？
 - 是否严格遵循分数动作边界（+2/0 不新增；-2 必剔除且禁复提）？
-- 是否仅输出 id 与 content，且为**合法 JSON**？
+- 输出是否为**合法 JSON**，元素仅含 id 与 content？
 
 【（只读）冻结清单】：
 {json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}
