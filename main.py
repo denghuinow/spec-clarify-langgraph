@@ -6,7 +6,7 @@ Multi-Agent SRS Generation with LangGraph
 
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
 - ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
-- DocGenerate：输出 Markdown（IEEE 29148-2018 结构）
+- DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
 - SimEvaluate：文本嵌入（不分片）评估两类相似度并打印：
     1) 生成 SRS（srs_output） vs 基准 SRS（reference_srs）
     2) 用户输入（user_input） vs 基准 SRS（reference_srs）
@@ -387,19 +387,50 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
 
 
 def doc_generate_node(state: GraphState, llm=None) -> GraphState:
-    """DocGenerate：将最终需求清单转为 Markdown（IEEE 29148-2018 结构）"""
+    """DocGenerate：将最终需求清单转为 Markdown（IEEE Std 830-1998 基本格式）"""
     log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
     stream_handler = StreamingPrinter()
     llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
+
+    # === 关键修改：输出结构切换为 IEEE Std 830-1998 基本格式 ===
     system = (
-        '你是"文档生成智能体（DocGenerate）"，将优化后的需求清单转化为符合 IEEE 29148-2018 的 SRS。\n'
-        '必须保留原始 id；按 FR/NFR/CON 分组；语言正式、无二义；'
-        '每条需求具备：触发条件→执行逻辑→结果输出→异常兜底。'
+        '你是"文档生成智能体（DocGenerate）"。请将优化后的需求清单转化为'
+        '遵循 IEEE Std 830-1998 的软件需求规格说明书（SRS），输出介质为 Markdown。\n\n'
+        "【结构与编号（须包含以下章节，必要时可精简无内容的小节但不得更名）：】\n"
+        "1. Introduction\n"
+        "   1.1 Purpose\n"
+        "   1.2 Document Conventions\n"
+        "   1.3 Intended Audience and Reading Suggestions\n"
+        "   1.4 Project Scope\n"
+        "   1.5 References\n"
+        "2. Overall Description\n"
+        "   2.1 Product Perspective\n"
+        "   2.2 Product Functions（高层功能概览，非逐条 FR）\n"
+        "   2.3 User Characteristics\n"
+        "   2.4 Constraints（高层约束，如法规、平台、组织策略）\n"
+        "   2.5 Assumptions and Dependencies\n"
+        "3. Specific Requirements\n"
+        "   3.1 External Interface Requirements（User / Hardware / Software / Communications）\n"
+        "   3.2 Functional Requirements（逐条列出，必须保留原始 id，如 FR-01；"
+        "每条包含：触发条件→执行逻辑→结果输出→异常兜底；应具可验证性和可追踪性）\n"
+        "   3.3 Performance Requirements（将 NFR-* 中与性能相关的条目归入，保留原始 id）\n"
+        "   3.4 Design Constraints（将 CON-* 或约束性 NFR 归入，保留原始 id）\n"
+        "   3.5 Software System Attributes（Reliability、Availability、Security、Maintainability、Portability 等；"
+        "映射 NFR-*，保留原始 id）\n"
+        "   3.6 Other Requirements（无法归入以上小节但仍必要的条目；保留原始 id）\n"
+        "4. Appendices（可选）\n"
+        "5. Index（可选）\n\n"
+        "【强制要求】\n"
+        "• 必须保留并原样展示清单中的需求 id（如 FR-xx / NFR-xx / CON-xx）。\n"
+        "• 将 FR-* 归入 3.2；将 NFR-* 与 CON-* 根据语义分别放入 3.3/3.4/3.5/3.6；若无法判断则置于 3.6，并注明理由。\n"
+        "• 语言正式、无二义、可测试；避免使用“可能/大概/TBD”等不确定措辞。\n"
+        "• 可使用表格或列表提高可读性，但章节与编号必须符合 830-1998 的基本结构。"
     )
+
     user = (
         "最终需求清单（JSON 数组）：\n"
         f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
-        "请输出 Markdown 版本 SRS："
+        "请输出遵循 IEEE Std 830-1998 基本格式的 Markdown 版本 SRS："
     )
     messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
 
