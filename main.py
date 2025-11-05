@@ -13,9 +13,10 @@ Multi-Agent SRS Generation with LangGraph
    同时打印三侧向量维度（gen/ref/user），维度不一致则跳过对应相似度计算。
 
 新增/修订要点：
-1) 评分语义拆分：explore_action（给 ReqExplore）与 clarify_action（给 ReqClarify）。
-2) 冻结：每轮最高分条目加入冻结；冻结项不再交给 ReqExplore，合并时强制回填。
-3) SimEvaluate：除原有 gen vs ref 相似度外，新增 user vs ref 相似度；打印向量维度。
+1) 评分语义直接内联到提示词中（不再使用 SCORE_POLICY）。
+2) 冻结：每轮仅冻结正向最高分（+1 或 +2）；冻结项不再交给 ReqExplore，合并时强制回填。
+3) 移除：被 ReqClarify 评为 -2 的条目直接移除并加入 removed_ids；后续迭代禁止复提或近义改写。
+4) SimEvaluate：除原有 gen vs ref 相似度外，新增 user vs ref 相似度；打印向量维度。
 """
 
 from __future__ import annotations
@@ -37,51 +38,6 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# =========================
-# 统一评分等级定义（集中配置）
-# 拆分 explore_action / clarify_action
-# =========================
-SCORE_POLICY: Dict[int, Dict[str, str]] = {
-    2: {
-        "label": "强采纳",
-        "explore_action": "保留并微调表达；确认隐含设定为已达成；仅做措辞精炼与条理化，不改变语义。",
-        "clarify_action": "判定与基准 SRS 完全一致或更优；给出高度肯定的简要理由；标注为可直接纳入与优先冻结的候选。"
-    },
-    1: {
-        "label": "采纳",
-        "explore_action": "保留并细化；补充输入/输出、权限、异常、数据一致性、状态机与用户反馈等缺失细节。",
-        "clarify_action": "基本符合基准 SRS；指出少量需补充的点（边界/异常/可观测性），鼓励完善后纳入。"
-    },
-    0: {
-        "label": "中性",
-        "explore_action": "保持或泛化；去除不确定假设，改为条件化表述；提升可检验性与边界定义。",
-        "clarify_action": "与基准 SRS 等效或信息不足；提示风险点与验证口径，建议保持或泛化后再评估。"
-    },
-    -1: {
-        "label": "不采纳",
-        "explore_action": "重写或替换；对齐业务目标和用户期望；明确触发条件、失败策略与回退路径。",
-        "clarify_action": "与基准 SRS 有偏差；指出具体缺口并建议重写方向或替代方案。"
-    },
-    -2: {
-        "label": "强不采纳",
-        "explore_action": "删除或用新条目替代；如保留原 id 则重新定义其 content 以满足业务目标和用户期望。",
-        "clarify_action": "严重偏离或违背约束；明确拒绝并建议删除或以新条目完全替代。"
-    },
-}
-
-def score_policy_text(role: str) -> str:
-    """
-    role ∈ {'explore', 'clarify'}，返回对应角色可读的评分语义说明文本。
-    """
-    assert role in {"explore", "clarify"}
-    header = "评分等级与含义（统一定义，面向 {}）：".format("ReqExplore" if role == "explore" else "ReqClarify")
-    lines = [header]
-    for k in sorted(SCORE_POLICY.keys(), reverse=True):
-        v = SCORE_POLICY[k]
-        action = v["explore_action"] if role == "explore" else v["clarify_action"]
-        lines.append(f"{k}（{v['label']}）：{action}")
-    return "\n".join(lines)
 
 
 def read_text_file(file_path: str, label: str) -> str:
@@ -220,6 +176,9 @@ class GraphState(TypedDict):
     frozen_ids: List[str]
     frozen_reqs: Dict[str, str]
 
+    # 已移除（-2）条目
+    removed_ids: List[str]
+
     # 文档相似度与维度（gen vs ref）
     embedding_similarity: Optional[float]
     embedding_distance: Optional[float]
@@ -263,93 +222,82 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
-    """ReqExplore：根据评分优化未冻结条目，输出新的完整需求清单（不处理冻结项）"""
+    """ReqExplore：根据评分优化未冻结条目，输出新的完整需求清单（不处理冻结项；剔除 removed_ids）"""
     llm = llm or get_llm()
     log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单（冻结项不参与）")
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
+    state.setdefault('removed_ids', [])
     frozen_ids_set = set(state['frozen_ids'])
+    removed_ids_set = set(state['removed_ids'])
+
+    # 仅对“未冻结且未被移除”的条目探索
+    unfrozen_list = [it for it in state['req_list']
+                     if it['id'] not in frozen_ids_set and it['id'] not in removed_ids_set]
 
     scores_arr_unfrozen = [{"id": rid, "score": sc}
                            for rid, sc in state.get("scores", {}).items()
-                           if rid not in frozen_ids_set]
-    unfrozen_list = [it for it in state['req_list'] if it['id'] not in frozen_ids_set]
+                           if rid not in frozen_ids_set and rid not in removed_ids_set]
+
     if not unfrozen_list:
-        log("ReqExplore：无未冻结需求，跳过模型调用，需求清单保持不变")
+        log("ReqExplore：无未冻结且未移除的需求，跳过模型调用，需求清单保持不变")
         return state
 
-    policy_text_explore = score_policy_text("explore")
     frozen_payload = [{"id": fid, "content": state["frozen_reqs"].get(fid, "")}
                       for fid in state["frozen_ids"]]
+    removed_payload = [{"id": rid} for rid in state["removed_ids"]]
 
     system = f"""
-你是“需求挖掘智能体（ReqExplore）”，一名资深软件需求分析师与逻辑闭环专家。你只对**未冻结**条目进行优化与发散补全；冻结条目严禁修改，也不要出现在你的输出中（系统稍后自动合并）。
+你是“需求挖掘智能体（ReqExplore）”，一名资深软件需求分析师与闭环设计专家。只对**未冻结且未被移除**的条目进行优化；冻结条目与已移除条目严禁修改，也不要出现在输出中（系统稍后合并）。
 
 【你将收到】
 - 未冻结条目清单（id, content）
-- 这些条目的评分与简评（来自用户或上一步评价）
+- 这些条目的评分（来自上一轮澄清）
+- （只读）冻结清单
+- （只读）已移除清单（禁止复提/改写）
 
 【按分数采取动作（务必遵循）】
-+2 强采纳：保留语义，仅做表达精炼与条理化，不改变含义。
-+1 采纳：保留并**细化**缺失细节（输入/输出、权限、异常与回退、数据一致性、状态机、用户反馈）。
- 0 中性：**保持或泛化**，删除不确定假设，改为**条件化**与**可检验**表述。
--1 不采纳：在不扩张无关范围的前提下**重写或替换**，更贴合**用户期望与场景约束**；明确触发、失败与回退路径。
--2 强不采纳：**替代重写**（无法在本轮真正删除原 id）。请保留原 id 并重写其 content 为“（已由 <NEW_ID> 替代）：……”，同时新增替代条目 <NEW_ID>（连续编号）。
++2（强采纳）：仅做表达精炼与条理化，不改变语义；不得新增条目。
++1（采纳）：保留并**细化**缺失细节（输入/输出、权限与审计、异常与回退、数据一致性与幂等、状态机、可观测性）；可做轻量结构化；如确有必要，可近邻新增 1~2 条直接依赖的支撑项。
+0（中性）：**保持或泛化**，去除不确定假设，改为**条件化/可检验**表述；不得新增条目。
+-1（不采纳）：在不扩张无关范围的前提下**重写或替换**，更贴合**用户期望与场景约束**；明确触发、失败与回退路径；可新增 ≤2 条近邻支撑项。
+-2（强不采纳）：**从清单中剔除该 id**；不得新增替代条目；**禁止以 FR/NFR/CON/SUG 任意形式复提或近义改写**。
 
-（评分语义补充）
-{policy_text_explore}
+【用户视角“近邻外推”（新增边界）】
+- 仅围绕现有意图的上下游必要步骤与合规/可靠/可观测性支撑；禁止跨域扩张。
+- 必要假设用“前提：…”显式化；禁止使用 TBD/？ 等占位。
 
-【用户视角“发散挖掘”（可新增条目，近邻外推）】
-- 仅做**近邻外推**：围绕现有意图的上下游步骤、必要的风控/合规/可靠性与可观测性，避免跨域扩张。
-- 新增条目优先用既有前缀（FR-/NFR-/CON-）。若难以判断，用 **SUG-xx**（候选增强）前缀；在 content 开头用“类型建议：FR/NFR/CON；理由：…”简述归类依据。（仍然只保留 id 与 content 两个字段）
-- 发散优先级（从用户价值出发）：
-  1) 端到端旅程补齐：注册/验证/登录/登出/找回/锁定/解锁/会话过期与续期；
-  2) 访问与授权：RBAC/ABAC、最小权限、敏感操作双人复核；
-  3) 安全与风控：速率限制、CAPTCHA、密码策略与弱口令拦截、越权防护、审计事件；
-  4) 可靠与一致：事务边界、幂等键、去重、重试与退避、熔断/降级；
-  5) 数据生命周期：来源→处理→消费→归档/清理、数据保留策略、可追踪ID；
-  6) 可观测性：结构化日志、核心指标、告警阈值、导出/追踪；
-  7) 性能与可用：分页/排序/过滤、批处理/导出格式、峰值吞吐与超时、缓存/队列使用前提；
-  8) 体验与合规：空状态/错误提示、国际化与时区、隐私与最小采集、可访问性。
-- 必要假设请内嵌为“前提：…”且配**可验证**落地描述；禁止使用 TBD/？ 等占位。
-
-【闭环模板（content 内部建议结构；字段名仅为提示，含义需清晰）】
-- 触发：…（谁/何时/何状态）
-- 输入：…（关键字段/来源/权限前置）
-- 处理：…（主要步骤或状态转换，含并发/幂等等要点）
-- 输出：…（可验证结果/副作用/审计点）
-- 异常与回退：…（失败策略/补偿/重试/超时/熔断）
-- 可观测性：…（日志/指标/告警/审计事件）
-- 前提：…（如有必要；用以显式化假设）
+【闭环模板（建议内嵌到 content）】
+- 触发：…  输入：…  处理：…  输出：…  异常与回退：…  可观测性：…  前提：…
 
 【编号与冲突】
-- 仅输出“**未冻结 + 新增**”条目；**不要**输出任何冻结条目。
-- 新增 FR/NFR/CON 在各自序列上**顺延编号**（如现有 FR-03，则新增从 FR-04 起）；SUG-xx 从 SUG-01 起，避免与现有 id 冲突。
-- 保持未冻结 id 的**相对顺序稳定**；避免引入与冻结条目**语义冲突**。
+- 仅输出“未冻结 + 新增”条目；**不要**输出任何冻结或已移除条目。
+- 新增 FR/NFR/CON 在各自序列上顺延编号；SUG-xx 从 SUG-01 起；避免与现有 id 冲突。
+- 保持未冻结 id 的相对顺序稳定；避免与冻结或已移除条目语义冲突。
 
-【自检清单（生成前必查）】
-- 是否为每条补齐了“触发→处理→输出→异常/回退→可观测性”的闭环？
-- 是否删除了不确定表述并给出“前提：…”说明？
-- 是否补齐必要的权限/审计/速率限制/幂等与数据一致性？
-- 是否满足“仅 id 与 content”的输出约束，且为**合法 JSON**？
+【自检清单】
+- 是否形成“触发→处理→输出→异常/回退→可观测性”的可验证闭环？
+- 是否删除模糊词并用“前提：…”显式化必要假设？
+- 是否严格遵循分数动作边界（+2/0 不新增；-2 必剔除且禁复提）？
+- 是否仅输出 id 与 content，且为**合法 JSON**？
 
-【输出要求（严格）】
-- 仅输出一个 **JSON 数组**（外层必须使用 ```json 围栏），每个元素对象只含：id, content。
-- 内容应简洁但可验证；不引入与当前场景无关的扩展；不使用占位或问题标记。
-
-【（只读）冻结清单：严禁输出或修改】
+【（只读）冻结清单】：
 {json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}
-"""
 
+【（只读）已移除清单（禁复提/改写）】：
+{json.dumps(removed_payload, ensure_ascii=False, indent=2) if removed_payload else '无'}
+"""
     user = (
-        "未冻结清单（JSON）：\n"
+        "未冻结且未移除清单（JSON）：\n"
         f"```json\n{json.dumps(unfrozen_list, ensure_ascii=False)}\n```\n\n"
-        "评分与简评（仅未冻结项，JSON）：\n"
+        "评分（仅未冻结且未移除项，JSON）：\n"
         f"```json\n{json.dumps(scores_arr_unfrozen, ensure_ascii=False)}\n```\n\n"
         "（只读）冻结清单（请勿输出或修改）：\n"
         f"{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}\n\n"
-        "请基于评分与“发散挖掘”规则，输出“仅含未冻结及新增 id”的需求清单（外层用 ```json 围栏；元素仅含 id, content）。"
-        "如需替代表达，请按 -2 规则保留原 id 并新增连续编号的替代条目；不得包含任何冻结 id。"
+        "（只读）已移除清单（请勿复提/改写）：\n"
+        f"{json.dumps(removed_payload, ensure_ascii=False, indent=2) if removed_payload else '无'}\n\n"
+        "请输出“仅含未冻结及新增 id”的清单（外层用 ```json 围栏；元素仅含 id, content）。"
+        "禁止包含任何冻结或已移除 id。"
     )
     messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
     resp = llm.invoke(messages)
@@ -357,35 +305,47 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     record_llm_interaction(state, agent="ReqExplore", iteration=state["iteration"],
                            messages=messages, raw_output=resp.content, parsed_output=unfrozen_new_list)
 
-    # 合并：冻结项强制回填 + 顺序稳定化
+    # 合并：冻结项强制回填；移除项彻底跳过；保持相对顺序；追加新增
     new_map: Dict[str, str] = {str(it["id"]): str(it["content"]) for it in unfrozen_new_list}
     prev_ids_order = [str(it["id"]) for it in state["req_list"]]
 
     merged: List[Dict[str, str]] = []
     for rid in prev_ids_order:
+        # 冻结项强制回填
         if rid in frozen_ids_set:
-            content = state["frozen_reqs"].get(rid,
-                      next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
-        else:
-            content = new_map.get(rid,
-                      next((x["content"] for x in state["req_list"] if x["id"] == rid), ""))
+            content = state["frozen_reqs"].get(
+                rid,
+                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
+            )
+            merged.append({"id": rid, "content": content})
+            continue
+        # 已移除项彻底跳过（真正删除）
+        if rid in removed_ids_set:
+            continue
+        # 未冻结未移除：用新内容（若无则沿用旧内容）
+        content = new_map.get(
+            rid,
+            next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
+        )
         merged.append({"id": rid, "content": content})
 
+    # 追加新增（若模型误把已移除 id 又生成了，这里也会被过滤掉）
     for rid, content in new_map.items():
-        if rid not in prev_ids_order:
+        if rid not in prev_ids_order and rid not in removed_ids_set:
             merged.append({"id": rid, "content": content})
 
     state["req_list"] = merged
-    log(f"ReqExplore：完成合并，共 {len(state['req_list'])} 条；冻结 {len(state['frozen_ids'])} 条（未参与优化）")
+    log(f"ReqExplore：完成合并，共 {len(state['req_list'])} 条；冻结 {len(state['frozen_ids'])} 条；已移除 {len(state['removed_ids'])} 条")
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
-    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮最高分"""
+    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮正向最高分；-2 直接移除并记录"""
     llm = llm or get_llm()
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
+    state.setdefault('removed_ids', [])
     frozen_ids_set = set(state['frozen_ids'])
 
     unfrozen_list = [item for item in state["req_list"] if item["id"] not in frozen_ids_set]
@@ -395,13 +355,23 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         state["iteration"] += 1
         return state
 
-    policy_text_clarify = score_policy_text("clarify")
     system = (
-        '你是"需求澄清智能体（ReqClarify）"，以需求方立场对需求清单逐项评分；'
-        '基准 SRS 是需求方诉求与底线，评分以其为依据。\n\n'
-        f"{policy_text_clarify}\n\n"
-        "评分标准：+2、+1、0、-1、-2；输出 ```json\n[{\"id\":\"FR-01\",\"score\":1,\"reason\":\"...\"}]\n```。"
-        "reason 可省略但应基于基准 SRS。"
+        '你是"需求澄清智能体（ReqClarify）"，以**需求方/验收方**立场对“未冻结”的需求逐条评分；'
+        '以“基准 SRS”为唯一标尺，锚定术语/量纲/阈值/角色称谓，禁止引入新需求或改写原文。\n\n'
+        '【评分口径】\n'
+        '+2（强采纳）：与基准 SRS 一致或更优；语义完整、可测试、边界清晰、无含糊词。\n'
+        '+1（采纳）：基本一致，仅缺少少量可验证细节（异常/权限/可观测性等）。\n'
+        '0（中性）：信息不足或不确定假设过多，需条件化或补充验证口径后再评估。\n'
+        '-1（不采纳）：与角色/范围/触发/结果/失败策略/一致性等存在明显缺口或偏差，应重写或替代。\n'
+        '-2（强不采纳）：与目标/约束/合规严重冲突或跨域；**应直接移除，并在后续迭代禁止复提或近义改写**。\n\n'
+        '【一致性约束】\n'
+        '• 必须对输入的每一条未冻结需求逐条给出评分；顺序与长度与输入一致；id 一一对应。\n'
+        '• 仅输出一个 ```json 围栏包裹的数组：[{\"id\":\"FR-01\",\"score\":1,\"reason\":\"...\"}]。\n'
+        '• reason 简洁可审计（≤50字），可用句式：\n'
+        '  - 一致性：与基准SRS{段/点}一致，边界/可测试充分；\n'
+        '  - 缺口：缺少{异常/权限/阈值/幂等/可观测}，基准SRS有要求；\n'
+        '  - 假设：存在未证实前提{…}，需条件化；\n'
+        '  - 冲突：与基准SRS在{角色/范围/合规}上冲突。'
     )
     user = (
         "需评分（未冻结）需求清单：\n"
@@ -425,17 +395,32 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         scores_map[rid] = sc
     state["scores"] = scores_map
 
+    # 标记 -2 为移除目标
+    to_remove_now = [rid for rid, sc in scores_map.items() if sc == -2]
+    if to_remove_now:
+        known = set(state["removed_ids"])
+        add_cnt = 0
+        for rid in to_remove_now:
+            if rid not in known:
+                state["removed_ids"].append(rid)
+                add_cnt += 1
+        log(f"ReqClarify：标记移除 {add_cnt} 项（-2），累计移除 {len(state['removed_ids'])} 项")
+
+    # 冻结仅限正向最高分（+1 或 +2）
     if scores_map:
         max_score = max(scores_map.values())
-        top_ids = [rid for rid, sc in scores_map.items() if sc == max_score]
-        req_map = {str(it["id"]): str(it["content"]) for it in state["req_list"]}
-        added = 0
-        for rid in top_ids:
-            if rid not in state["frozen_ids"]:
-                state["frozen_ids"].append(rid)
-                state["frozen_reqs"][rid] = req_map.get(rid, "")
-                added += 1
-        log(f"ReqClarify：本轮最高分 = {max_score}，新增冻结 {added} 项；累计冻结 {len(state['frozen_ids'])} 项")
+        if max_score >= 1:
+            top_ids = [rid for rid, sc in scores_map.items() if sc == max_score]
+            req_map = {str(it["id"]): str(it["content"]) for it in state["req_list"]}
+            added = 0
+            for rid in top_ids:
+                if rid not in state["frozen_ids"]:
+                    state["frozen_ids"].append(rid)
+                    state["frozen_reqs"][rid] = req_map.get(rid, "")
+                    added += 1
+            log(f"ReqClarify：本轮最高正向分 = {max_score}，新增冻结 {added} 项；累计冻结 {len(state['frozen_ids'])} 项")
+        else:
+            log("ReqClarify：本轮最高分 < 1（无正向高分），不新增冻结项")
     else:
         log("ReqClarify：本轮无评分结果，未新增冻结项")
 
@@ -449,6 +434,12 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
     stream_handler = StreamingPrinter()
     llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
+
+    # 兜底过滤：移除 -2 条目
+    effective_req_list = [
+        it for it in state['req_list']
+        if it['id'] not in set(state.get('removed_ids', []))
+    ]
 
     # === 关键修改：输出结构切换为 IEEE Std 830-1998 基本格式 ===
     system = (
@@ -479,17 +470,17 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         "4. Appendices（可选）\n"
         "5. Index（可选）\n\n"
         "【需求编号规范】\n"
-        "• 需求 id 格式：FR-01, FR-02, ...（功能需求，两位数字）；NFR-01, NFR-02, ...（非功能需求）；CON-01, CON-02, ...（约束）\n"
+        "• 需求 id 格式：FR-01, FR-02, ...；NFR-01, NFR-02, ...；CON-01, CON-02, ...\n"
         "• 必须保留并原样展示清单中的需求 id，不得修改或重新编号\n\n"
         "【强制要求】\n"
         "• 将 FR-* 归入 3.2；将 NFR-* 与 CON-* 根据语义分别放入 3.3/3.4/3.5/3.6；若无法判断则置于 3.6，并注明理由。\n"
-        "• 语言正式、无二义、可测试；避免使用'可能/大概/TBD'等不确定措辞。\n"
+        "• 语言正式、无二义、可测试；避免使用“可能/大概/TBD”等不确定措辞。\n"
         "• 可使用表格或列表提高可读性，但章节与编号必须符合 830-1998 的基本结构。"
     )
 
     user = (
         "最终需求清单（JSON 数组）：\n"
-        f"```json\n{json.dumps(state['req_list'], ensure_ascii=False)}\n```\n\n"
+        f"```json\n{json.dumps(effective_req_list, ensure_ascii=False)}\n```\n\n"
         "请输出遵循 IEEE Std 830-1998 基本格式的 Markdown 版本 SRS："
     )
     messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
@@ -660,6 +651,8 @@ def run_demo(demo: DemoInput):
         # 冻结机制
         "frozen_ids": [],
         "frozen_reqs": {},
+        # 已移除（-2）
+        "removed_ids": [],
         # gen vs ref
         "embedding_similarity": None,
         "embedding_distance": None,
@@ -708,7 +701,6 @@ DEFAULT_USER_INPUT = (
     "系统需在高峰期保持快速响应；需要访问控制与审计。"
 )
 DEFAULT_REFERENCE_SRS = (
-    "# 参考SRS（摘要）\n"
     "- FR：注册、登录、退出；管理员查看与按时间过滤导出活动；\n"
     "- NFR：响应时间 ≤ 2s，并发 ≥ 1000；\n"
     "- CON：遵从公司安全策略和访问控制规范；"
