@@ -7,16 +7,9 @@ Multi-Agent SRS Generation with LangGraph
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
 - ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
-- SimEvaluate：文本嵌入（不分片）评估两类相似度并打印：
+- SimEvaluate：文本嵌入评估两类相似度并打印：
     1) 生成 SRS（srs_output） vs 基准 SRS（reference_srs）
     2) 用户输入（user_input） vs 基准 SRS（reference_srs）
-   同时打印三侧向量维度（gen/ref/user），维度不一致则跳过对应相似度计算。
-
-新增/修订要点：
-1) 评分语义直接内联到提示词中（不再使用 SCORE_POLICY）。
-2) 冻结：每轮仅冻结正向最高分（+1 或 +2）；冻结项不再交给 ReqExplore，合并时强制回填。
-3) 移除：被 ReqClarify 评为 -2 的条目直接移除并加入 removed_ids；后续迭代禁止复提或近义改写。
-4) SimEvaluate：除原有 gen vs ref 相似度外，新增 user vs ref 相似度；打印向量维度。
 """
 
 from __future__ import annotations
@@ -40,6 +33,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+# -----------------------------
+# 基础工具
+# -----------------------------
+def log(message: str) -> None:
+    """Print log messages immediately for real-time feedback."""
+    print(f"[日志] {message}", flush=True)
+
+
 def read_text_file(file_path: str, label: str) -> str:
     """Read UTF-8 text from the given file path, raising a helpful error if missing."""
     resolved_path = os.path.expanduser(file_path)
@@ -50,9 +51,129 @@ def read_text_file(file_path: str, label: str) -> str:
         return f.read()
 
 
-def log(message: str) -> None:
-    """Print log messages immediately for real-time feedback."""
-    print(f"[日志] {message}", flush=True)
+class StreamingPrinter(BaseCallbackHandler):
+    """简单的流式打印回调，便于观测模型输出过程。"""
+    def __init__(self) -> None:
+        self._buffer: List[str] = []
+
+    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:  # type: ignore[override]
+        print(token, end="", flush=True)
+        self._buffer.append(token)
+
+    def get_text(self) -> str:
+        return "".join(self._buffer)
+
+
+def _parse_env_float(name: str, default: float) -> float:
+    try:
+        v = os.getenv(name)
+        return float(v) if v not in (None, "") else default
+    except Exception:
+        return default
+
+
+def get_agent_temperature(agent: str) -> float:
+    """
+    默认温度：
+      ReqParse: 0.2   —— 解析与严格 JSON，更稳
+      ReqExplore: 0.6 —— 受控挖掘，允许适度外推
+      ReqClarify: 0.2 —— 判定与对齐，需一致性
+      DocGenerate: 0.1 —— 文档成形，稳定输出
+    可通过环境变量覆盖：
+      OPENAI_TEMP_REQPARSE / OPENAI_TEMP_REQEXPLORE / OPENAI_TEMP_REQCLARIFY / OPENAI_TEMP_DOCGENERATE
+    """
+    defaults = {
+        "ReqParse": 0.2,
+        "ReqExplore": 0.6,
+        "ReqClarify": 0.2,
+        "DocGenerate": 0.1,
+    }
+    env_key = f"OPENAI_TEMP_{agent.upper()}"
+    return _parse_env_float(env_key, defaults.get(agent, 0.7))
+
+
+def get_llm(
+    model: Optional[str] = None,
+    temperature: float = 0.7,
+    streaming: bool = False,
+    callbacks: Optional[List[Any]] = None,
+):
+    """
+    包装 ChatOpenAI，兼容私有 base_url；附加合理的重试与超时。
+    说明：具体可用参数随 langchain_openai 版本可能变化，未识别参数会被忽略。
+    """
+    model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    kwargs: Dict[str, Any] = {
+        "model": model,
+        "temperature": temperature,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    if streaming:
+        kwargs["streaming"] = True
+    if callbacks:
+        kwargs["callbacks"] = callbacks
+    # 软性支持：若 SDK 识别，以下可生效；不识别则被忽略，不影响运行
+    kwargs.setdefault("timeout", 120)
+    kwargs.setdefault("max_retries", 3)
+    return ChatOpenAI(**kwargs)
+
+
+def get_llm_for(
+    agent: str,
+    model: Optional[str] = None,
+    streaming: bool = False,
+    callbacks: Optional[List[Any]] = None,
+):
+    temp = get_agent_temperature(agent)
+    llm = get_llm(model=model, temperature=temp, streaming=streaming, callbacks=callbacks)
+    log(f"{agent} LLM 初始化：temperature={temp}")
+    return llm
+
+
+def get_embeddings_model(model: Optional[str] = None):
+    model = model or os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    kwargs: Dict[str, Any] = {"model": model}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAIEmbeddings(**kwargs)
+
+
+def extract_first_json(text: str) -> Any:
+    """
+    从模型输出中**尽力**提取第一段 JSON（支持 ```json ...``` 或裸 JSON）。
+    - 优先匹配代码围栏；若失败，退化到大括号/中括号的首次匹配尝试。
+    - 若全部失败，抛出异常并附加输出片段，便于诊断。
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("模型输出为空，无法解析 JSON。")
+
+    # 优先：```json ... ```
+    fence = re.findall(r"```json\s*(\{.*?\}|\[.*?\])\s*```", text, flags=re.S)
+    candidates = fence if fence else re.findall(r"(\{.*?\}|\[.*?\])", text, flags=re.S)
+
+    for c in candidates:
+        try:
+            return json.loads(c)
+        except Exception:
+            continue
+
+    preview = text.strip()
+    if len(preview) > 800:
+        preview = preview[:800] + "...(截断)"
+    raise ValueError("未能从模型输出中解析出有效 JSON。原始输出预览:\n" + preview)
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    va = np.array(a, dtype=np.float32)
+    vb = np.array(b, dtype=np.float32)
+    na = np.linalg.norm(va)
+    nb = np.linalg.norm(vb)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(va, vb) / (na * nb))
 
 
 def record_llm_interaction(
@@ -64,7 +185,7 @@ def record_llm_interaction(
     raw_output: Any,
     parsed_output: Any = None,
 ) -> None:
-    """记录每次模型调用的输入与输出，并立即打印。"""
+    """统一记录 LLM 交互，保证日志可审计。"""
     if isinstance(raw_output, list):
         raw_text = "".join(str(part) for part in raw_output)
     elif isinstance(raw_output, str):
@@ -91,75 +212,8 @@ def record_llm_interaction(
         log(f"{agent}（第 {iteration} 轮）输出（原始）：\n{raw_text}")
 
 
-class StreamingPrinter(BaseCallbackHandler):
-    """Stream tokens to stdout while buffering the full text."""
-    def __init__(self) -> None:
-        self._buffer: List[str] = []
-
-    def on_llm_new_token(self, token: str, **kwargs: Any) -> None:  # type: ignore[override]
-        print(token, end="", flush=True)
-        self._buffer.append(token)
-
-    def get_text(self) -> str:
-        return "".join(self._buffer)
-
-
 # -----------------------------
-# LLM / Embeddings
-# -----------------------------
-def get_llm(
-    model: str = None,
-    temperature: float = 0.7,
-    streaming: bool = False,
-    callbacks: Optional[List[Any]] = None,
-):
-    model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    kwargs: Dict[str, Any] = {"model": model, "temperature": temperature}
-    if base_url:
-        kwargs["base_url"] = base_url
-    if streaming:
-        kwargs["streaming"] = True
-    if callbacks:
-        kwargs["callbacks"] = callbacks
-    return ChatOpenAI(**kwargs)
-
-
-def get_embeddings_model(model: str = None):
-    """默认 text-embedding-3-large；兼容 OPENAI_BASE_URL。"""
-    model = model or os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    kwargs: Dict[str, Any] = {"model": model}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAIEmbeddings(**kwargs)
-
-
-def extract_first_json(text: str) -> Any:
-    """从模型输出中提取第一个 JSON 数组或对象（容错围栏/噪声）。"""
-    fence = re.findall(r"```json\s*(\{.*?\}|\[.*?\])\s*```", text, flags=re.S)
-    candidates = fence if fence else re.findall(r"(\{.*?\}|\[.*?\])", text, flags=re.S)
-    for c in candidates:
-        try:
-            return json.loads(c)
-        except Exception:
-            continue
-    raise ValueError("未能从模型输出中解析出有效 JSON。原始输出:\n" + text)
-
-
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """计算余弦相似度。"""
-    va = np.array(a, dtype=np.float32)
-    vb = np.array(b, dtype=np.float32)
-    na = np.linalg.norm(va)
-    nb = np.linalg.norm(vb)
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return float(np.dot(va, vb) / (na * nb))
-
-
-# -----------------------------
-# 系统状态
+# 状态结构
 # -----------------------------
 class GraphState(TypedDict):
     user_input: str
@@ -172,20 +226,16 @@ class GraphState(TypedDict):
     srs_output: str
     srs_stream_printed: bool
 
-    # 冻结机制
     frozen_ids: List[str]
     frozen_reqs: Dict[str, str]
 
-    # 已移除（-2）条目
     removed_ids: List[str]
 
-    # 文档相似度与维度（gen vs ref）
     embedding_similarity: Optional[float]
     embedding_distance: Optional[float]
     embedding_dim_gen: Optional[int]
     embedding_dim_ref: Optional[int]
 
-    # 用户输入 vs 基准 SRS 的相似度与维度
     embedding_similarity_user_ref: Optional[float]
     embedding_distance_user_ref: Optional[float]
     embedding_dim_user: Optional[int]
@@ -196,11 +246,10 @@ class GraphState(TypedDict):
 # -----------------------------
 def req_parse_node(state: GraphState, llm=None) -> GraphState:
     """ReqParse：自然语言 -> 初始需求清单（JSON 数组，仅含 id 与 content）"""
-    llm = llm or get_llm()
+    llm = llm or get_llm_for("ReqParse")
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
 
-    # === 提示词升级（原子化拆分 / 术语锚定 / 判别启发）===
     system = (
         '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为**原子化**的初始清单。\n'
         '\n'
@@ -243,15 +292,22 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
         state, agent="ReqParse", iteration=current_iteration,
         messages=messages, raw_output=resp.content, parsed_output=parsed
     )
-    state["req_list"] = parsed
+    # 轻量合法化：保证每条都只有 id/content 且为字符串
+    normalized: List[Dict[str, str]] = []
+    for it in parsed:
+        rid = str(it.get("id"))
+        content = str(it.get("content", "")).strip()
+        if not rid or not content:
+            continue
+        normalized.append({"id": rid, "content": content})
+    state["req_list"] = normalized
     state["iteration"] = current_iteration
-    log(f"ReqParse：解析完成，共 {len(parsed)} 条需求")
+    log(f"ReqParse：解析完成，共 {len(normalized)} 条需求")
     return state
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
-    """ReqExplore：根据评分优化未冻结条目，输出新的完整需求清单（不处理冻结项；剔除 removed_ids）"""
-    llm = llm or get_llm()
+    llm = llm or get_llm_for("ReqExplore")
     log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单（冻结项不参与）")
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
@@ -259,9 +315,11 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     frozen_ids_set = set(state['frozen_ids'])
     removed_ids_set = set(state['removed_ids'])
 
-    # 仅对“未冻结且未被移除”的条目探索
-    unfrozen_list = [it for it in state['req_list']
-                     if it['id'] not in frozen_ids_set and it['id'] not in removed_ids_set]
+    # 仅“未冻结&未移除”参与
+    unfrozen_list = [
+        it for it in state['req_list']
+        if it['id'] not in frozen_ids_set and it['id'] not in removed_ids_set
+    ]
 
     scores_arr_unfrozen = [{"id": rid, "score": sc}
                            for rid, sc in state.get("scores", {}).items()
@@ -275,7 +333,6 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
                       for fid in state["frozen_ids"]]
     removed_payload = [{"id": rid} for rid in state["removed_ids"]]
 
-    # === 提示词升级（闭环补全 / 近邻外推 / 边界控制 / JSON 严格）===
     system = f"""
 你是“需求挖掘智能体（ReqExplore）”，资深需求工程师与闭环设计专家。只对**未冻结且未移除**的条目进行优化；
 冻结条目与已移除条目严禁修改，也不要出现在输出中（系统稍后合并）。
@@ -340,31 +397,36 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     record_llm_interaction(state, agent="ReqExplore", iteration=state["iteration"],
                            messages=messages, raw_output=resp.content, parsed_output=unfrozen_new_list)
 
-    # 合并：冻结项强制回填；移除项彻底跳过；保持相对顺序；追加新增
-    new_map: Dict[str, str] = {str(it["id"]): str(it["content"]) for it in unfrozen_new_list}
+    # 以新输出为准，合并冻结与未移除项；对越界新增/重复做去重校正
+    new_map: Dict[str, str] = {}
+    for it in unfrozen_new_list:
+        rid = str(it.get("id"))
+        if not rid or rid in frozen_ids_set or rid in removed_ids_set:
+            continue  # 模型越界输出，丢弃
+        content = str(it.get("content", "")).strip()
+        if not content:
+            continue
+        new_map[rid] = content  # 若重复，以最后一次为准
+
     prev_ids_order = [str(it["id"]) for it in state["req_list"]]
 
     merged: List[Dict[str, str]] = []
     for rid in prev_ids_order:
-        # 冻结项强制回填
+        if rid in removed_ids_set:
+            continue  # 已移除，跳过
         if rid in frozen_ids_set:
             content = state["frozen_reqs"].get(
-                rid,
-                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
+                rid, next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
             )
             merged.append({"id": rid, "content": content})
-            continue
-        # 已移除项彻底跳过（真正删除）
-        if rid in removed_ids_set:
-            continue
-        # 未冻结未移除：用新内容（若无则沿用旧内容）
-        content = new_map.get(
-            rid,
-            next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
-        )
-        merged.append({"id": rid, "content": content})
+        else:
+            # 未冻结 -> 采用 new_map 中的更新；若不存在，则沿用旧值（模型可能未返回）
+            content = new_map.get(
+                rid, next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
+            )
+            merged.append({"id": rid, "content": content})
 
-    # 追加新增（若模型误把已移除 id 又生成了，这里也会被过滤掉）
+    # 附加“真正新增”的条目（不在 prev_ids 中，且未移除）
     for rid, content in new_map.items():
         if rid not in prev_ids_order and rid not in removed_ids_set:
             merged.append({"id": rid, "content": content})
@@ -375,8 +437,7 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
-    """ReqClarify：对每条需求逐项评分（仅未冻结），并冻结本轮正向最高分；-2 直接移除并记录"""
-    llm = llm or get_llm()
+    llm = llm or get_llm_for("ReqClarify")
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
     state.setdefault('frozen_ids', [])
     state.setdefault('frozen_reqs', {})
@@ -401,12 +462,8 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         '-2（强不采纳）：与目标/约束/合规严重冲突或跨域；**应直接移除，并在后续迭代禁止复提或近义改写**。\n\n'
         '【一致性约束】\n'
         '• 必须对输入的每一条未冻结需求逐条给出评分；顺序与长度与输入一致；id 一一对应。\n'
-        '• 仅输出一个 ```json 围栏包裹的数组：[{\"id\":\"FR-01\",\"score\":1,\"reason\":\"...\"}]。\n'
-        '• reason 简洁可审计（≤50字），可用句式：\n'
-        '  - 一致性：与基准SRS{段/点}一致，边界/可测试充分；\n'
-        '  - 缺口：缺少{异常/权限/阈值/幂等/可观测}，基准SRS有要求；\n'
-        '  - 假设：存在未证实前提{…}，需条件化；\n'
-        '  - 冲突：与基准SRS在{角色/范围/合规}上冲突。'
+        '• 仅输出一个 ```json 围栏包裹的数组：[{"id":"FR-01","score":1,"reason":"..."}]。\n'
+        '• reason 简洁可审计（≤50字）。'
     )
     user = (
         "需评分（未冻结）需求清单：\n"
@@ -423,14 +480,20 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     record_llm_interaction(state, agent="ReqClarify", iteration=state["iteration"],
                            messages=messages, raw_output=resp.content, parsed_output=evaluations)
 
+    # 规范化评分映射
     scores_map: Dict[str, int] = {}
     for item in evaluations:
         rid = str(item.get("id"))
-        sc = int(item.get("score"))
-        scores_map[rid] = sc
+        sc_val = item.get("score")
+        try:
+            sc = int(sc_val)
+        except Exception:
+            continue
+        if rid:
+            scores_map[rid] = sc
     state["scores"] = scores_map
 
-    # 标记 -2 为移除目标
+    # -2 强不采纳 -> 标记移除
     to_remove_now = [rid for rid, sc in scores_map.items() if sc == -2]
     if to_remove_now:
         known = set(state["removed_ids"])
@@ -441,7 +504,7 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
                 add_cnt += 1
         log(f"ReqClarify：标记移除 {add_cnt} 项（-2），累计移除 {len(state['removed_ids'])} 项")
 
-    # 冻结仅限正向最高分（+1 或 +2）
+    # 冻结策略：取本轮最高正向分（>=1）的所有 id 进入冻结
     if scores_map:
         max_score = max(scores_map.values())
         if max_score >= 1:
@@ -465,18 +528,15 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
 
 
 def doc_generate_node(state: GraphState, llm=None) -> GraphState:
-    """DocGenerate：将最终需求清单转为 Markdown（IEEE Std 830-1998 基本格式）"""
     log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
     stream_handler = StreamingPrinter()
-    llm = llm or get_llm(temperature=0.1, streaming=True, callbacks=[stream_handler])
+    llm = llm or get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
 
-    # 兜底过滤：移除 -2 条目
     effective_req_list = [
         it for it in state['req_list']
         if it['id'] not in set(state.get('removed_ids', []))
     ]
 
-    # === 关键修改：输出结构切换为 IEEE Std 830-1998 基本格式 ===
     system = (
         '你是"文档生成智能体（DocGenerate）"。请将优化后的需求清单转化为'
         '遵循 IEEE Std 830-1998 的软件需求规格说明书（SRS），输出介质为 Markdown。\n\n'
@@ -510,7 +570,6 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         "【强制要求】\n"
         "• 将 FR-* 归入 3.2；将 NFR-* 与 CON-* 根据语义分别放入 3.3/3.4/3.5/3.6；若无法判断则置于 3.6，并注明理由。\n"
         "• 语言正式、无二义、可测试；避免使用“可能/大概/TBD”等不确定措辞。\n"
-        "• 可使用表格或列表提高可读性，但章节与编号必须符合 830-1998 的基本结构。"
     )
 
     user = (
@@ -540,11 +599,11 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 
 
 def sim_evaluate_node(state: GraphState) -> GraphState:
-    """SimEvaluate：嵌入（不分片）计算并打印两类相似度与向量维度：
+    """SimEvaluate：嵌入计算并打印两类相似度与向量维度：
         A) 生成文档（srs_output） vs 基准 SRS（reference_srs）
         B) 用户输入（user_input） vs 基准 SRS（reference_srs）
     """
-    log("SimEvaluate：开始计算文本嵌入相似度（不分片）")
+    log("SimEvaluate：开始计算文本嵌入相似度")
     if not state.get("srs_output"):
         log("SimEvaluate：未检测到生成文档内容（srs_output 为空），仍将计算 user_input vs reference_srs。")
 
@@ -592,7 +651,6 @@ def sim_evaluate_node(state: GraphState) -> GraphState:
         dim_ref2 = len(vec_ref2)
 
         state["embedding_dim_user"] = dim_user
-        # 对 ref 维度，若已有（A）则无需覆盖；此处仅用于日志展示
         print(f"\n====== 嵌入信息（SimEvaluate: UserInput vs Reference） ======\n"
               f"Embedding Dim (UserInput)  : {dim_user}\n"
               f"Embedding Dim (Reference)  : {dim_ref2}\n", flush=True)
@@ -613,7 +671,7 @@ def sim_evaluate_node(state: GraphState) -> GraphState:
             log(f"SimEvaluate：user vs ref 相似度={sim_ur:.6f}，距离={dist_ur:.6f}")
 
     except Exception as e:
-        # 统一失败兜底
+        # 将尽可能多的维度信息保留下来，方便诊断
         state["embedding_dim_gen"] = state.get("embedding_dim_gen", None)
         state["embedding_dim_ref"] = state.get("embedding_dim_ref", None)
         state["embedding_dim_user"] = state.get("embedding_dim_user", None)
@@ -638,9 +696,6 @@ def should_continue(state: GraphState) -> str:
     return "ReqExplore"
 
 
-# -----------------------------
-# 构建 LangGraph
-# -----------------------------
 def build_graph():
     graph = StateGraph(GraphState)
     graph.add_node("ReqParse", req_parse_node)
@@ -661,9 +716,6 @@ def build_graph():
     return graph.compile()
 
 
-# -----------------------------
-# 演示运行
-# -----------------------------
 class DemoInput(BaseModel):
     user_input: str = Field(..., description="自然语言需求")
     reference_srs: str = Field(..., description="基准SRS（文本）")
@@ -683,17 +735,13 @@ def run_demo(demo: DemoInput):
         "max_iterations": demo.max_iterations,
         "srs_output": "",
         "srs_stream_printed": False,
-        # 冻结机制
         "frozen_ids": [],
         "frozen_reqs": {},
-        # 已移除（-2）
         "removed_ids": [],
-        # gen vs ref
         "embedding_similarity": None,
         "embedding_distance": None,
         "embedding_dim_gen": None,
         "embedding_dim_ref": None,
-        # user vs ref
         "embedding_similarity_user_ref": None,
         "embedding_distance_user_ref": None,
         "embedding_dim_user": None,
@@ -706,7 +754,6 @@ def run_demo(demo: DemoInput):
         print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
         print(final_state["srs_output"], flush=True)
 
-    # 摘要回显（SimEvaluate 已打印详细信息）
     print("\n====== 相似度摘要 ======", flush=True)
     print("Dims => gen: {}, ref: {}, user: {}".format(
         final_state.get("embedding_dim_gen"),
@@ -727,9 +774,7 @@ def run_demo(demo: DemoInput):
         print("UserInput vs Reference => 未计算（维度不一致或错误）", flush=True)
 
 
-# -----------------------------
-# 示例入口
-# -----------------------------
+# 默认示例
 DEFAULT_USER_INPUT = (
     "我们需要一个用户管理系统："
     "用户可注册/登录/退出；管理员可查看并按时间导出用户活动记录；"
@@ -744,24 +789,39 @@ DEFAULT_REFERENCE_SRS = (
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LangGraph 多智能体 SRS 生成演示脚本")
+    # 1) 文件输入
     parser.add_argument("-u", "--user-input", type=str, help="用户需求文本文件路径（user_input）")
     parser.add_argument("-r", "--reference-srs", type=str, help="参考 SRS 文本文件路径（reference_srs）")
-    parser.add_argument("-m", "--max-iterations", type=int, default=2, help="最大迭代轮数，默认 5")
+    # 2) 直接文本（优先级高于文件）
+    parser.add_argument("--user-text", type=str, help="用户需求文本内容，直接传入字符串")
+    parser.add_argument("--reference-text", type=str, help="参考 SRS 文本内容，直接传入字符串")
+    # 3) 迭代轮数
+    parser.add_argument("-m", "--max-iterations", type=int, default=5, help="最大迭代轮数，默认 5")
+
     args = parser.parse_args()
 
-    if bool(args.user_input) ^ bool(args.reference_srs):
-        parser.error("必须同时提供 --user-input 与 --reference-srs。")
+    # 参数校验与选择：优先使用直接文本；其次文件；都缺失则使用内置示例
+    has_text_pair = bool(args.user_text) and bool(args.reference_text)
+    has_file_pair = bool(args.user_input) and bool(args.reference_srs)
 
-    if args.user_input and args.reference_srs:
+    if (args.user_text and not args.reference_text) or (args.reference_text and not args.user_text):
+        parser.error("直接文本模式必须同时提供 --user-text 与 --reference-text。")
+    if (args.user_input and not args.reference_srs) or (args.reference_srs and not args.user_input):
+        parser.error("文件模式必须同时提供 --user-input 与 --reference-srs。")
+
+    if has_text_pair:
+        user_input_text = args.user_text
+        reference_srs_text = args.reference_text
+        log("使用命令行直接文本作为输入")
+    elif has_file_pair:
         user_input_text = read_text_file(args.user_input, "user_input")
         reference_srs_text = read_text_file(args.reference_srs, "reference_srs")
     else:
         user_input_text = DEFAULT_USER_INPUT
         reference_srs_text = DEFAULT_REFERENCE_SRS
+        log("未提供文本/文件参数，使用内置示例场景")
 
     demo = DemoInput(user_input=user_input_text, reference_srs=reference_srs_text, max_iterations=args.max_iterations)
-    if not args.user_input:
-        log("未提供参数，使用内置示例场景")
     run_demo(demo)
 
 
