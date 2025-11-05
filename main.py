@@ -242,8 +242,13 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     current_iteration = state["iteration"] + 1
     system = (
         '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为结构化初始清单。\n\n'
+        '【需求编号规范】\n'
+        '- 功能需求（Functional Requirements）：FR-01, FR-02, FR-03, ...（从01开始，连续递增，使用两位数字）\n'
+        '- 非功能需求（Non-Functional Requirements）：NFR-01, NFR-02, NFR-03, ...（从01开始，连续递增）\n'
+        '- 约束（Constraints）：CON-01, CON-02, CON-03, ...（从01开始，连续递增）\n'
+        '- 编号格式：前缀（FR/NFR/CON）- 两位数字（01-99），编号必须连续且唯一\n\n'
         '输出规范：```json\n[{"id": "FR-01", "content": "..."}]\n```（仅 id 与 content）。\n'
-        '不得引入占位或问题标记；保持原术语与风格一致。'
+        '不得引入占位或问题标记；保持原术语与风格一致；严格按照上述编号规范分配 id。'
     )
     user = f"用户需求：\n{state['user_input']}\n\n请仅输出结构化 JSON 数组，外层用 ```json``` 包裹。"
     messages = [{"role": "system", "content": system},{"role": "user", "content": user}]
@@ -280,6 +285,12 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     system = (
         '你是"需求挖掘智能体（ReqExplore）"，仅对未冻结 id 做闭环补全与优化。\n\n'
         f"{policy_text_explore}\n\n"
+        "【需求编号规范（必须严格遵守）】\n"
+        "- 功能需求：FR-01, FR-02, FR-03, ...（两位数字，从01开始）\n"
+        "- 非功能需求：NFR-01, NFR-02, NFR-03, ...（两位数字，从01开始）\n"
+        "- 约束：CON-01, CON-02, CON-03, ...（两位数字，从01开始）\n"
+        "- 新增 id 必须遵循上述格式，且与现有编号保持连续（不得重复或跳跃）\n"
+        "- 若删除原 id，新增 id 应填补空缺；若替换，可保留原 id 或使用新连续编号\n\n"
         "按评分采取动作（保留并微调/细化、保持或泛化、重写或替代、删除）。可新增连续编号的新 id 承载替代稿。\n"
         "只读冻结清单如下（严禁输出或修改这些 id；系统稍后自动合并）：\n"
         f"{json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else '无'}\n\n"
@@ -420,10 +431,12 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         "   3.6 Other Requirements（无法归入以上小节但仍必要的条目；保留原始 id）\n"
         "4. Appendices（可选）\n"
         "5. Index（可选）\n\n"
+        "【需求编号规范】\n"
+        "• 需求 id 格式：FR-01, FR-02, ...（功能需求，两位数字）；NFR-01, NFR-02, ...（非功能需求）；CON-01, CON-02, ...（约束）\n"
+        "• 必须保留并原样展示清单中的需求 id，不得修改或重新编号\n\n"
         "【强制要求】\n"
-        "• 必须保留并原样展示清单中的需求 id（如 FR-xx / NFR-xx / CON-xx）。\n"
         "• 将 FR-* 归入 3.2；将 NFR-* 与 CON-* 根据语义分别放入 3.3/3.4/3.5/3.6；若无法判断则置于 3.6，并注明理由。\n"
-        "• 语言正式、无二义、可测试；避免使用“可能/大概/TBD”等不确定措辞。\n"
+        "• 语言正式、无二义、可测试；避免使用'可能/大概/TBD'等不确定措辞。\n"
         "• 可使用表格或列表提高可读性，但章节与编号必须符合 830-1998 的基本结构。"
     )
 
