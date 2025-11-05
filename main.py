@@ -60,12 +60,12 @@ SCORE_POLICY: Dict[int, Dict[str, str]] = {
     },
     -1: {
         "label": "不采纳",
-        "explore_action": "重写或替换；对齐基准 SRS 与业务目标；明确触发条件、失败策略与回退路径。",
+        "explore_action": "重写或替换；对齐业务目标和用户期望；明确触发条件、失败策略与回退路径。",
         "clarify_action": "与基准 SRS 有偏差；指出具体缺口并建议重写方向或替代方案。"
     },
     -2: {
         "label": "强不采纳",
-        "explore_action": "删除或用新条目替代；如保留原 id 则重新定义其 content 以满足基准要求。",
+        "explore_action": "删除或用新条目替代；如保留原 id 则重新定义其 content 以满足业务目标和用户期望。",
         "clarify_action": "严重偏离或违背约束；明确拒绝并建议删除或以新条目完全替代。"
     },
 }
