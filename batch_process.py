@@ -12,7 +12,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import pandas as pd
@@ -31,7 +31,8 @@ class BatchProcessor:
         output_dir: str,
         max_iterations: int = 5,
         max_files: int = None,
-        max_workers: int = 1
+        max_workers: int = 1,
+        ablation_mode: Optional[str] = None
     ):
         """
         初始化批量处理器
@@ -43,6 +44,7 @@ class BatchProcessor:
             max_iterations: 最大迭代轮数
             max_files: 最大处理文件数（None表示处理所有文件）
             max_workers: 最大并发线程数（默认: 1，即串行执行）
+            ablation_mode: 消融实验模式（no-clarify 或 no-explore-clarify）
         """
         self.user_input_dir = Path(user_input_dir)
         self.reference_srs_dir = Path(reference_srs_dir)
@@ -50,6 +52,7 @@ class BatchProcessor:
         self.max_iterations = max_iterations
         self.max_files = max_files
         self.max_workers = max_workers
+        self.ablation_mode = ablation_mode
         
         # 创建输出目录结构
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -111,7 +114,8 @@ class BatchProcessor:
             demo = DemoInput(
                 user_input=user_input,
                 reference_srs=reference_srs,
-                max_iterations=self.max_iterations
+                max_iterations=self.max_iterations,
+                ablation_mode=self.ablation_mode
             )
             
             # 运行演示（silent=True 以减少输出）
@@ -134,6 +138,7 @@ class BatchProcessor:
                 "user_input_file": str(user_file),
                 "reference_srs_file": str(ref_file),
                 "max_iterations": self.max_iterations,
+                "ablation_mode": self.ablation_mode,
                 "final_iteration": final_state["iteration"],
                 "elapsed_time_seconds": elapsed_time,
                 "req_list": final_state["req_list"],
@@ -258,6 +263,8 @@ class BatchProcessor:
         log(f"参考SRS目录: {self.reference_srs_dir}")
         log(f"输出目录: {self.output_dir}")
         log(f"最大迭代轮数: {self.max_iterations}")
+        if self.ablation_mode is not None:
+            log(f"消融实验模式: {self.ablation_mode}")
         if self.max_files is not None:
             log(f"最大处理文件数: {self.max_files}")
         log(f"并发线程数: {self.max_workers}")
@@ -390,6 +397,13 @@ def main():
         default=1,
         help="最大并发线程数（默认: 1，即串行执行）"
     )
+    parser.add_argument(
+        "--ablation-mode",
+        type=str,
+        choices=["no-clarify", "no-explore-clarify"],
+        default=None,
+        help="消融实验模式：no-clarify（移除需求澄清智能体）或 no-explore-clarify（移除需求挖掘+澄清智能体）"
+    )
     
     args = parser.parse_args()
     
@@ -413,7 +427,8 @@ def main():
         output_dir=args.output_dir,
         max_iterations=args.max_iterations,
         max_files=args.max_files,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        ablation_mode=args.ablation_mode
     )
     processor.run()
 

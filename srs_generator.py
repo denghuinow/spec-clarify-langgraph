@@ -237,6 +237,8 @@ class GraphState(TypedDict):
     embedding_similarity: Optional[float]
     embedding_similarity_user_ref: Optional[float]
 
+    ablation_mode: Optional[str]     # 消融实验模式：no-clarify 或 no-explore-clarify
+
 
 # -----------------------------
 # 节点实现
@@ -644,6 +646,10 @@ def sim_evaluate_node(state: GraphState) -> GraphState:
 # -----------------------------
 def should_continue(state: GraphState) -> str:
     """达到最大迭代轮数后结束，否则继续。"""
+    # no-clarify 模式：ReqExplore 只执行一次，直接进入 DocGenerate
+    if state.get("ablation_mode") == "no-clarify":
+        log("条件判断：no-clarify 模式，ReqExplore 执行一次后直接进入文档生成")
+        return "DocGenerate"
     if state["iteration"] > state["max_iterations"]:
         log("条件判断：达到最大迭代次数，进入文档生成")
         return "DocGenerate"
@@ -651,21 +657,41 @@ def should_continue(state: GraphState) -> str:
     return "ReqExplore"
 
 
-def build_graph():
+def build_graph(ablation_mode: Optional[str] = None):
     graph = StateGraph(GraphState)
     graph.add_node("ReqParse", req_parse_node)
-    graph.add_node("ReqExplore", req_explore_node)
-    graph.add_node("ReqClarify", req_clarify_node)
     graph.add_node("DocGenerate", doc_generate_node)
     graph.add_node("SimEvaluate", sim_evaluate_node)
 
     graph.set_entry_point("ReqParse")
-    graph.add_edge("ReqParse", "ReqExplore")
-    graph.add_edge("ReqExplore", "ReqClarify")
-    graph.add_conditional_edges("ReqClarify", should_continue, {
-        "ReqExplore": "ReqExplore",
-        "DocGenerate": "DocGenerate"
-    })
+
+    if ablation_mode == "no-explore-clarify":
+        # 模式：移除 ReqExplore + ReqClarify
+        # 流程：ReqParse -> DocGenerate -> SimEvaluate
+        log("构建图结构：no-explore-clarify 模式（跳过 ReqExplore 和 ReqClarify）")
+        graph.add_edge("ReqParse", "DocGenerate")
+    elif ablation_mode == "no-clarify":
+        # 模式：移除 ReqClarify
+        # 流程：ReqParse -> ReqExplore -> DocGenerate -> SimEvaluate
+        log("构建图结构：no-clarify 模式（跳过 ReqClarify，ReqExplore 执行一次）")
+        graph.add_node("ReqExplore", req_explore_node)
+        graph.add_edge("ReqParse", "ReqExplore")
+        graph.add_conditional_edges("ReqExplore", should_continue, {
+            "DocGenerate": "DocGenerate"
+        })
+    else:
+        # 默认模式：完整流程
+        # 流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate
+        log("构建图结构：默认模式（完整流程）")
+        graph.add_node("ReqExplore", req_explore_node)
+        graph.add_node("ReqClarify", req_clarify_node)
+        graph.add_edge("ReqParse", "ReqExplore")
+        graph.add_edge("ReqExplore", "ReqClarify")
+        graph.add_conditional_edges("ReqClarify", should_continue, {
+            "ReqExplore": "ReqExplore",
+            "DocGenerate": "DocGenerate"
+        })
+
     graph.add_edge("DocGenerate", "SimEvaluate")
     graph.add_edge("SimEvaluate", END)
     return graph.compile()
@@ -675,6 +701,7 @@ class DemoInput(BaseModel):
     user_input: str = Field(..., description="自然语言需求")
     reference_srs: str = Field(..., description="基准SRS（文本）")
     max_iterations: int = 5
+    ablation_mode: Optional[str] = Field(default=None, description="消融实验模式：no-clarify 或 no-explore-clarify")
 
 
 def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
@@ -688,7 +715,7 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
     Returns:
         最终状态字典
     """
-    app = build_graph()
+    app = build_graph(ablation_mode=demo.ablation_mode)
     if not silent:
         log("启动 LangGraph 演示流程")
     init: GraphState = {
@@ -706,6 +733,7 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "removed_ids": [],
         "embedding_similarity": None,
         "embedding_similarity_user_ref": None,
+        "ablation_mode": demo.ablation_mode,
     }
     final_state = app.invoke(init)
     if not silent:
@@ -754,6 +782,14 @@ def main() -> None:
     parser.add_argument("--reference-text", type=str, help="参考 SRS 文本内容，直接传入字符串")
     # 3) 迭代轮数
     parser.add_argument("-m", "--max-iterations", type=int, default=5, help="最大迭代轮数，默认 5")
+    # 4) 消融实验模式
+    parser.add_argument(
+        "--ablation-mode",
+        type=str,
+        choices=["no-clarify", "no-explore-clarify"],
+        default=None,
+        help="消融实验模式：no-clarify（移除需求澄清智能体）或 no-explore-clarify（移除需求挖掘+澄清智能体）"
+    )
 
     args = parser.parse_args()
 
@@ -778,7 +814,12 @@ def main() -> None:
         reference_srs_text = DEFAULT_REFERENCE_SRS
         log("未提供文本/文件参数，使用内置示例场景")
 
-    demo = DemoInput(user_input=user_input_text, reference_srs=reference_srs_text, max_iterations=args.max_iterations)
+    demo = DemoInput(
+        user_input=user_input_text,
+        reference_srs=reference_srs_text,
+        max_iterations=args.max_iterations,
+        ablation_mode=args.ablation_mode
+    )
     run_demo(demo)
 
 
