@@ -11,3 +11,8 @@ wheels/
 .env
 batch_output_*
 compare_output
+batch_output/batch_summary.json
+batch_output/similarity_table.csv
+batch_output/similarity_table.xlsx
+batch_output/logs/0000 - cctns.pdf_log.json
+batch_output/srs_output/0000 - cctns.pdf_srs.md

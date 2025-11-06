@@ -786,10 +786,12 @@ dependencies = [
     { name = "langchain-openai" },
     { name = "langgraph" },
     { name = "numpy" },
+    { name = "openai" },
     { name = "openpyxl" },
     { name = "pandas" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "requests" },
 ]
 
 [package.metadata]
@@ -798,10 +800,12 @@ requires-dist = [
     { name = "langchain-openai", specifier = ">=1.0.1" },
     { name = "langgraph", specifier = ">=1.0.2" },
     { name = "numpy", specifier = ">=2.3.4" },
+    { name = "openai", specifier = ">=1.0.0" },
     { name = "openpyxl", specifier = ">=3.0.0" },
     { name = "pandas", specifier = ">=2.0.0" },
     { name = "pydantic", specifier = ">=2.12.3" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "requests", specifier = ">=2.31.0" },
 ]
 
 [[package]]

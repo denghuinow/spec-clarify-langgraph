@@ -2,14 +2,11 @@
 """
 Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
-流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate -> END
+流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> END
 
 - ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
 - ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
 - DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
-- SimEvaluate：文本嵌入评估两类相似度并打印：
-    1) 生成 SRS（srs_output） vs 基准 SRS（reference_srs）
-    2) 用户输入（user_input） vs 基准 SRS（reference_srs）
 """
 
 from __future__ import annotations
@@ -20,10 +17,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
-import numpy as np
-
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_core.callbacks.base import BaseCallbackHandler
 from pydantic import BaseModel, Field
 
@@ -31,9 +26,6 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# 从独立模块导入文本相似度计算函数
-from text_similarity import compute_direct_distance
 
 
 # -----------------------------
@@ -138,15 +130,6 @@ def get_llm_for(
     return llm
 
 
-def get_embeddings_model(model: Optional[str] = None):
-    model = model or os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    kwargs: Dict[str, Any] = {"model": model}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAIEmbeddings(**kwargs)
-
-
 def extract_first_json(text: str) -> Any:
     """
     从模型输出中**尽力**提取第一段 JSON（支持 ```json ...``` 或裸 JSON）。
@@ -222,16 +205,6 @@ def invoke_with_json_retry(
     )
 
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    va = np.array(a, dtype=np.float32)
-    vb = np.array(b, dtype=np.float32)
-    na = np.linalg.norm(va)
-    nb = np.linalg.norm(vb)
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return float(np.dot(va, vb) / (na * nb))
-
-
 def record_llm_interaction(
     state: "GraphState",
     *,
@@ -286,9 +259,6 @@ class GraphState(TypedDict):
     frozen_reqs: Dict[str, str]
 
     removed_ids: List[str]
-
-    embedding_similarity: Optional[float]
-    embedding_similarity_user_ref: Optional[float]
 
     ablation_mode: Optional[str]  # 消融实验模式：no-clarify 或 no-explore-clarify
 
@@ -718,59 +688,6 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     return state
 
 
-def sim_evaluate_node(state: GraphState) -> GraphState:
-    """SimEvaluate：嵌入计算并打印两类相似度：
-    A) 生成文档（srs_output） vs 基准 SRS（reference_srs）
-    B) 用户输入（user_input） vs 基准 SRS（reference_srs）
-
-    使用直接调用 OpenAI embeddings API 的方式，进行 L2 归一化后计算点积（余弦相似度）
-    """
-    log("SimEvaluate：开始计算文本嵌入相似度（使用直接距离计算方法）")
-    if not state.get("srs_output"):
-        log(
-            "SimEvaluate：未检测到生成文档内容（srs_output 为空），仍将计算 user_input vs reference_srs。"
-        )
-
-    try:
-        embedding_model = os.environ.get(
-            "OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"
-        )
-
-        # --- (A) 生成文档 vs 基准 SRS ---
-        if state.get("srs_output"):
-            sim_gr = compute_direct_distance(
-                state["srs_output"],
-                state["reference_srs"],
-                embedding_model=embedding_model,
-            )
-            state["embedding_similarity"] = sim_gr
-            print(
-                f"====== 嵌入相似度（Generated vs Reference） ======\n"
-                f"Cosine Similarity : {sim_gr:.6f}\n",
-                flush=True,
-            )
-        else:
-            state["embedding_similarity"] = None
-
-        # --- (B) 用户输入 vs 基准 SRS ---
-        sim_ur = compute_direct_distance(
-            state["user_input"], state["reference_srs"], embedding_model=embedding_model
-        )
-        state["embedding_similarity_user_ref"] = sim_ur
-        print(
-            f"====== 嵌入相似度（UserInput vs Reference） ======\n"
-            f"Cosine Similarity : {sim_ur:.6f}\n",
-            flush=True,
-        )
-
-    except Exception as e:
-        state["embedding_similarity"] = None
-        state["embedding_similarity_user_ref"] = None
-        log(f"SimEvaluate：计算嵌入相似度失败：{e}")
-
-    return state
-
-
 # -----------------------------
 # 条件路由：是否继续迭代
 # -----------------------------
@@ -791,18 +708,17 @@ def build_graph(ablation_mode: Optional[str] = None):
     graph = StateGraph(GraphState)
     graph.add_node("ReqParse", req_parse_node)
     graph.add_node("DocGenerate", doc_generate_node)
-    graph.add_node("SimEvaluate", sim_evaluate_node)
 
     graph.set_entry_point("ReqParse")
 
     if ablation_mode == "no-explore-clarify":
         # 模式：移除 ReqExplore + ReqClarify
-        # 流程：ReqParse -> DocGenerate -> SimEvaluate
+        # 流程：ReqParse -> DocGenerate -> END
         log("构建图结构：no-explore-clarify 模式（跳过 ReqExplore 和 ReqClarify）")
         graph.add_edge("ReqParse", "DocGenerate")
     elif ablation_mode == "no-clarify":
         # 模式：移除 ReqClarify
-        # 流程：ReqParse -> ReqExplore -> DocGenerate -> SimEvaluate
+        # 流程：ReqParse -> ReqExplore -> DocGenerate -> END
         log("构建图结构：no-clarify 模式（跳过 ReqClarify，ReqExplore 执行一次）")
         graph.add_node("ReqExplore", req_explore_node)
         graph.add_edge("ReqParse", "ReqExplore")
@@ -811,7 +727,7 @@ def build_graph(ablation_mode: Optional[str] = None):
         )
     else:
         # 默认模式：完整流程
-        # 流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> SimEvaluate
+        # 流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> END
         log("构建图结构：默认模式（完整流程）")
         graph.add_node("ReqExplore", req_explore_node)
         graph.add_node("ReqClarify", req_clarify_node)
@@ -823,8 +739,7 @@ def build_graph(ablation_mode: Optional[str] = None):
             {"ReqExplore": "ReqExplore", "DocGenerate": "DocGenerate"},
         )
 
-    graph.add_edge("DocGenerate", "SimEvaluate")
-    graph.add_edge("SimEvaluate", END)
+    graph.add_edge("DocGenerate", END)
     return graph.compile()
 
 
@@ -864,8 +779,6 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "frozen_ids": [],
         "frozen_reqs": {},
         "removed_ids": [],
-        "embedding_similarity": None,
-        "embedding_similarity_user_ref": None,
         "ablation_mode": demo.ablation_mode,
     }
     final_state = app.invoke(init)
@@ -876,18 +789,6 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         else:
             print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
             print(final_state["srs_output"], flush=True)
-
-        print("\n====== 相似度摘要 ======", flush=True)
-        sim_gr = final_state.get("embedding_similarity")
-        sim_ur = final_state.get("embedding_similarity_user_ref")
-        if sim_gr is not None:
-            print(f"Generated vs Reference => Cosine: {sim_gr:.6f}", flush=True)
-        else:
-            print("Generated vs Reference => 未计算", flush=True)
-        if sim_ur is not None:
-            print(f"UserInput vs Reference => Cosine: {sim_ur:.6f}", flush=True)
-        else:
-            print("UserInput vs Reference => 未计算", flush=True)
 
     return final_state
 
