@@ -18,7 +18,7 @@ import argparse
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import numpy as np
 
@@ -169,6 +169,54 @@ def extract_first_json(text: str) -> Any:
     raise ValueError("未能从模型输出中解析出有效 JSON。原始输出预览:\n" + preview)
 
 
+def invoke_with_json_retry(
+    llm: ChatOpenAI,
+    messages: List[Dict[str, str]],
+    max_retries: int = 3
+) -> Tuple[Any, str]:
+    """
+    调用 LLM 并自动重试 JSON 解析失败的情况
+    
+    Args:
+        llm: ChatOpenAI 实例
+        messages: 要发送的消息列表（重试时保持完全不变）
+        max_retries: 最大重试次数（默认 3）
+    
+    Returns:
+        (parsed_json, raw_output): 解析后的 JSON 和原始输出
+    
+    Raises:
+        ValueError: 如果所有重试都失败，包含所有尝试的错误信息
+    """
+    errors: List[str] = []
+    
+    for attempt in range(max_retries):
+        try:
+            resp = llm.invoke(messages)
+            raw_output = resp.content if isinstance(resp.content, str) else str(resp.content)
+            parsed = extract_first_json(raw_output)
+            
+            if attempt > 0:
+                log(f"JSON 解析重试成功（第 {attempt + 1} 次尝试）")
+            
+            return parsed, raw_output
+        except ValueError as e:
+            error_msg = f"第 {attempt + 1} 次尝试失败: {str(e)}"
+            errors.append(error_msg)
+            
+            if attempt < max_retries - 1:
+                log(f"JSON 解析失败，{error_msg}，将进行重试（剩余 {max_retries - attempt - 1} 次）")
+            else:
+                log(f"JSON 解析失败，{error_msg}，已达到最大重试次数")
+    
+    # 所有重试都失败
+    all_errors = "\n".join(errors)
+    raise ValueError(
+        f"JSON 解析失败，已重试 {max_retries} 次均失败。\n"
+        f"所有尝试的错误信息：\n{all_errors}"
+    )
+
+
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     va = np.array(a, dtype=np.float32)
     vb = np.array(b, dtype=np.float32)
@@ -273,7 +321,7 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
         '\n'
         '【输出格式（仅 JSON 数组，元素字段仅含 id 与 content）】\n'
         '```json\n'
-        '[{"id":"FR-01","content":"……"}]\n'
+        '[{{"id":"FR-01","content":"……"}}]\n'
         '```\n'
         '不得出现除 id、content 之外的字段；不得输出解释、表格或注释。\n'
         '\n'
@@ -288,11 +336,10 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     user = user_template.format(user_input=state['user_input'])
 
     messages = [{"role": "user", "content": user}]
-    resp = llm.invoke(messages)
-    parsed = extract_first_json(resp.content)
+    parsed, raw_output = invoke_with_json_retry(llm, messages, max_retries=3)
     record_llm_interaction(
         state, agent="ReqParse", iteration=current_iteration,
-        messages=messages, raw_output=resp.content, parsed_output=parsed
+        messages=messages, raw_output=raw_output, parsed_output=parsed
     )
     # 轻量合法化：保证每条都只有 id/content 且为字符串
     normalized: List[Dict[str, str]] = []
@@ -417,10 +464,9 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     )
 
     messages = [{"role": "user", "content": user}]
-    resp = llm.invoke(messages)
-    unfrozen_new_list = extract_first_json(resp.content)
+    unfrozen_new_list, raw_output = invoke_with_json_retry(llm, messages, max_retries=3)
     record_llm_interaction(state, agent="ReqExplore", iteration=state["iteration"],
-                           messages=messages, raw_output=resp.content, parsed_output=unfrozen_new_list)
+                           messages=messages, raw_output=raw_output, parsed_output=unfrozen_new_list)
 
     # 以新输出为准，合并冻结与未移除项；对越界新增/重复做去重校正
     new_map: Dict[str, str] = {}
@@ -492,7 +538,7 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         '\n'
         '【一致性约束】\n'
         '• 必须对输入的每一条未冻结需求逐条给出评分；顺序与长度与输入一致；id 一一对应。\n'
-        '• 仅输出一个 ```json 围栏包裹的数组：[{"id":"FR-01","score":1,"reason":"..."}]。\n'
+        '• 仅输出一个 ```json 围栏包裹的数组：[{{"id":"FR-01","score":1,"reason":"..."}}]。\n'
         '• reason 简洁可审计（≤50字）。\n'
         '\n'
         '---\n'
@@ -516,10 +562,9 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     )
 
     messages = [{"role": "user", "content": user}]
-    resp = llm.invoke(messages)
-    evaluations = extract_first_json(resp.content)
+    evaluations, raw_output = invoke_with_json_retry(llm, messages, max_retries=3)
     record_llm_interaction(state, agent="ReqClarify", iteration=state["iteration"],
-                           messages=messages, raw_output=resp.content, parsed_output=evaluations)
+                           messages=messages, raw_output=raw_output, parsed_output=evaluations)
 
     # 规范化评分映射
     scores_map: Dict[str, int] = {}
@@ -584,41 +629,7 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     user_template = (
         '你是"文档生成智能体（DocGenerate）"。请将优化后的需求清单转化为'
         '遵循 IEEE Std 830-1998 的软件需求规格说明书（SRS），输出介质为 Markdown。\n'
-        '\n'
-        '【结构与编号（须包含以下章节，必要时可精简无内容的小节但不得更名）：】\n'
-        '1. Introduction\n'
-        '   1.1 Purpose\n'
-        '   1.2 Document Conventions\n'
-        '   1.3 Intended Audience and Reading Suggestions\n'
-        '   1.4 Project Scope\n'
-        '   1.5 References\n'
-        '2. Overall Description\n'
-        '   2.1 Product Perspective\n'
-        '   2.2 Product Functions（高层功能概览，非逐条 FR）\n'
-        '   2.3 User Characteristics\n'
-        '   2.4 Constraints（高层约束，如法规、平台、组织策略）\n'
-        '   2.5 Assumptions and Dependencies\n'
-        '3. Specific Requirements\n'
-        '   3.1 External Interface Requirements（User / Hardware / Software / Communications）\n'
-        '   3.2 Functional Requirements（逐条列出，必须保留原始 id，如 FR-01；'
-        '   3.3 Performance Requirements（将 NFR-* 中与性能相关的条目归入，保留原始 id）\n'
-        '   3.4 Design Constraints（将 CON-* 或约束性 NFR 归入，保留原始 id）\n'
-        '   3.5 Software System Attributes（Reliability、Availability、Security、Maintainability、Portability 等；'
-        '映射 NFR-*，保留原始 id）\n'
-        '   3.6 Other Requirements（无法归入以上小节但仍必要的条目；保留原始 id）\n'
-        '4. Appendices（可选）\n'
-        '5. Index（可选）\n'
-        '\n'
-        '【需求编号规范】\n'
-        '• 需求 id 格式：FR-01, FR-02, ...；NFR-01, NFR-02, ...；CON-01, CON-02, ...\n'
-        '• 必须保留并原样展示清单中的需求 id，不得修改或重新编号\n'
-        '\n'
-        '【强制要求】\n'
-        '• 将 FR-* 归入 3.2；将 NFR-* 与 CON-* 根据语义分别放入 3.3/3.4/3.5/3.6；若无法判断则置于 3.6，并注明理由。\n'
         '• 语言正式、无二义、可测试；避免使用"可能/大概/TBD"等不确定措辞。\n'
-        '\n'
-        '---\n'
-        '\n'
         '最终需求清单（JSON 数组）：\n'
         '```json\n'
         '{effective_req_list_json}\n'
