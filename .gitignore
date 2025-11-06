@@ -10,3 +10,4 @@ wheels/
 .venv
 .env
 batch_output_*
+compare_output
