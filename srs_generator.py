@@ -32,6 +32,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 从独立模块导入文本相似度计算函数
+from text_similarity import compute_direct_distance
+
 
 # -----------------------------
 # 基础工具
@@ -232,13 +235,7 @@ class GraphState(TypedDict):
     removed_ids: List[str]
 
     embedding_similarity: Optional[float]
-    embedding_distance: Optional[float]
-    embedding_dim_gen: Optional[int]
-    embedding_dim_ref: Optional[int]
-
     embedding_similarity_user_ref: Optional[float]
-    embedding_distance_user_ref: Optional[float]
-    embedding_dim_user: Optional[int]
 
 
 # -----------------------------
@@ -556,7 +553,6 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
         "3. Specific Requirements\n"
         "   3.1 External Interface Requirements（User / Hardware / Software / Communications）\n"
         "   3.2 Functional Requirements（逐条列出，必须保留原始 id，如 FR-01；"
-        "每条包含：触发条件→执行逻辑→结果输出→异常兜底；应具可验证性和可追踪性）\n"
         "   3.3 Performance Requirements（将 NFR-* 中与性能相关的条目归入，保留原始 id）\n"
         "   3.4 Design Constraints（将 CON-* 或约束性 NFR 归入，保留原始 id）\n"
         "   3.5 Software System Attributes（Reliability、Availability、Security、Maintainability、Portability 等；"
@@ -599,86 +595,45 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 
 
 def sim_evaluate_node(state: GraphState) -> GraphState:
-    """SimEvaluate：嵌入计算并打印两类相似度与向量维度：
+    """SimEvaluate：嵌入计算并打印两类相似度：
         A) 生成文档（srs_output） vs 基准 SRS（reference_srs）
         B) 用户输入（user_input） vs 基准 SRS（reference_srs）
+        
+        使用直接调用 OpenAI embeddings API 的方式，进行 L2 归一化后计算点积（余弦相似度）
     """
-    log("SimEvaluate：开始计算文本嵌入相似度")
+    log("SimEvaluate：开始计算文本嵌入相似度（使用直接距离计算方法）")
     if not state.get("srs_output"):
         log("SimEvaluate：未检测到生成文档内容（srs_output 为空），仍将计算 user_input vs reference_srs。")
 
     try:
-        emb = get_embeddings_model()
+        embedding_model = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 
         # --- (A) 生成文档 vs 基准 SRS ---
         if state.get("srs_output"):
-            vec_gen = emb.embed_query(state["srs_output"])
-            vec_ref = emb.embed_query(state["reference_srs"])
-            dim_gen = len(vec_gen)
-            dim_ref = len(vec_ref)
-
-            state["embedding_dim_gen"] = dim_gen
-            state["embedding_dim_ref"] = dim_ref
-
-            print(f"\n====== 嵌入信息（SimEvaluate: Generated vs Reference） ======\n"
-                  f"Embedding Dim (Generated) : {dim_gen}\n"
-                  f"Embedding Dim (Reference) : {dim_ref}\n", flush=True)
-            log(f"SimEvaluate：gen/ref 维度 gen={dim_gen}, ref={dim_ref}")
-
-            if dim_gen != dim_ref:
-                log("SimEvaluate：警告——gen/ref 维度不一致，跳过 gen vs ref 相似度计算")
-                state["embedding_similarity"] = None
-                state["embedding_distance"] = None
-            else:
-                sim_gr = cosine_similarity(vec_gen, vec_ref)
-                dist_gr = 1.0 - sim_gr
-                state["embedding_similarity"] = sim_gr
-                state["embedding_distance"] = dist_gr
-                print(f"====== 嵌入相似度（Generated vs Reference） ======\n"
-                      f"Cosine Similarity : {sim_gr:.6f}\n"
-                      f"Distance (1 - cos): {dist_gr:.6f}\n", flush=True)
-                log(f"SimEvaluate：gen vs ref 相似度={sim_gr:.6f}，距离={dist_gr:.6f}")
+            sim_gr = compute_direct_distance(
+                state["srs_output"],
+                state["reference_srs"],
+                embedding_model=embedding_model
+            )
+            state["embedding_similarity"] = sim_gr
+            print(f"====== 嵌入相似度（Generated vs Reference） ======\n"
+                  f"Cosine Similarity : {sim_gr:.6f}\n", flush=True)
         else:
-            state["embedding_dim_gen"] = None
-            state["embedding_dim_ref"] = None
             state["embedding_similarity"] = None
-            state["embedding_distance"] = None
 
         # --- (B) 用户输入 vs 基准 SRS ---
-        vec_user = emb.embed_query(state["user_input"])
-        vec_ref2 = emb.embed_query(state["reference_srs"])
-        dim_user = len(vec_user)
-        dim_ref2 = len(vec_ref2)
-
-        state["embedding_dim_user"] = dim_user
-        print(f"\n====== 嵌入信息（SimEvaluate: UserInput vs Reference） ======\n"
-              f"Embedding Dim (UserInput)  : {dim_user}\n"
-              f"Embedding Dim (Reference)  : {dim_ref2}\n", flush=True)
-        log(f"SimEvaluate：user/ref 维度 user={dim_user}, ref={dim_ref2}")
-
-        if dim_user != dim_ref2:
-            log("SimEvaluate：警告——user/ref 维度不一致，跳过 user vs ref 相似度计算")
-            state["embedding_similarity_user_ref"] = None
-            state["embedding_distance_user_ref"] = None
-        else:
-            sim_ur = cosine_similarity(vec_user, vec_ref2)
-            dist_ur = 1.0 - sim_ur
-            state["embedding_similarity_user_ref"] = sim_ur
-            state["embedding_distance_user_ref"] = dist_ur
-            print(f"====== 嵌入相似度（UserInput vs Reference） ======\n"
-                  f"Cosine Similarity : {sim_ur:.6f}\n"
-                  f"Distance (1 - cos): {dist_ur:.6f}\n", flush=True)
-            log(f"SimEvaluate：user vs ref 相似度={sim_ur:.6f}，距离={dist_ur:.6f}")
+        sim_ur = compute_direct_distance(
+            state["user_input"],
+            state["reference_srs"],
+            embedding_model=embedding_model
+        )
+        state["embedding_similarity_user_ref"] = sim_ur
+        print(f"====== 嵌入相似度（UserInput vs Reference） ======\n"
+              f"Cosine Similarity : {sim_ur:.6f}\n", flush=True)
 
     except Exception as e:
-        # 将尽可能多的维度信息保留下来，方便诊断
-        state["embedding_dim_gen"] = state.get("embedding_dim_gen", None)
-        state["embedding_dim_ref"] = state.get("embedding_dim_ref", None)
-        state["embedding_dim_user"] = state.get("embedding_dim_user", None)
         state["embedding_similarity"] = None
-        state["embedding_distance"] = None
         state["embedding_similarity_user_ref"] = None
-        state["embedding_distance_user_ref"] = None
         log(f"SimEvaluate：计算嵌入相似度失败：{e}")
 
     return state
@@ -722,9 +677,20 @@ class DemoInput(BaseModel):
     max_iterations: int = 5
 
 
-def run_demo(demo: DemoInput):
+def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
+    """
+    运行演示流程，返回最终状态。
+    
+    Args:
+        demo: 演示输入
+        silent: 如果为 True，不打印输出（用于批量处理）
+    
+    Returns:
+        最终状态字典
+    """
     app = build_graph()
-    log("启动 LangGraph 演示流程")
+    if not silent:
+        log("启动 LangGraph 演示流程")
     init: GraphState = {
         "user_input": demo.user_input,
         "reference_srs": demo.reference_srs,
@@ -739,39 +705,30 @@ def run_demo(demo: DemoInput):
         "frozen_reqs": {},
         "removed_ids": [],
         "embedding_similarity": None,
-        "embedding_distance": None,
-        "embedding_dim_gen": None,
-        "embedding_dim_ref": None,
         "embedding_similarity_user_ref": None,
-        "embedding_distance_user_ref": None,
-        "embedding_dim_user": None,
     }
     final_state = app.invoke(init)
-    log("流程结束，输出结果")
-    if final_state["srs_stream_printed"]:
-        print("\n====== Markdown SRS 输出已通过流式打印展示 ======\n", flush=True)
-    else:
-        print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
-        print(final_state["srs_output"], flush=True)
+    if not silent:
+        log("流程结束，输出结果")
+        if final_state["srs_stream_printed"]:
+            print("\n====== Markdown SRS 输出已通过流式打印展示 ======\n", flush=True)
+        else:
+            print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
+            print(final_state["srs_output"], flush=True)
 
-    print("\n====== 相似度摘要 ======", flush=True)
-    print("Dims => gen: {}, ref: {}, user: {}".format(
-        final_state.get("embedding_dim_gen"),
-        final_state.get("embedding_dim_ref"),
-        final_state.get("embedding_dim_user")
-    ), flush=True)
-    sim_gr = final_state.get("embedding_similarity")
-    dst_gr = final_state.get("embedding_distance")
-    sim_ur = final_state.get("embedding_similarity_user_ref")
-    dst_ur = final_state.get("embedding_distance_user_ref")
-    if sim_gr is not None and dst_gr is not None:
-        print(f"Generated vs Reference => Cosine: {sim_gr:.6f}, Distance: {dst_gr:.6f}", flush=True)
-    else:
-        print("Generated vs Reference => 未计算（维度不一致或错误）", flush=True)
-    if sim_ur is not None and dst_ur is not None:
-        print(f"UserInput vs Reference => Cosine: {sim_ur:.6f}, Distance: {dst_ur:.6f}", flush=True)
-    else:
-        print("UserInput vs Reference => 未计算（维度不一致或错误）", flush=True)
+        print("\n====== 相似度摘要 ======", flush=True)
+        sim_gr = final_state.get("embedding_similarity")
+        sim_ur = final_state.get("embedding_similarity_user_ref")
+        if sim_gr is not None:
+            print(f"Generated vs Reference => Cosine: {sim_gr:.6f}", flush=True)
+        else:
+            print("Generated vs Reference => 未计算", flush=True)
+        if sim_ur is not None:
+            print(f"UserInput vs Reference => Cosine: {sim_ur:.6f}", flush=True)
+        else:
+            print("UserInput vs Reference => 未计算", flush=True)
+    
+    return final_state
 
 
 # 默认示例
