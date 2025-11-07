@@ -24,7 +24,7 @@ import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
@@ -296,6 +296,11 @@ class GraphState(TypedDict):
     srs_stream_printed: bool
     ablation_mode: Optional[str]  # 消融实验模式：no-clarify 或 no-explore-clarify
     parallel_workers: Optional[int]  # 并行处理的工作线程数
+    req_max_scores: Dict[str, int]  # 每个需求的历史最高分 {req_id: max_score}
+    req_scores_history: Dict[str, List[int]]  # 每个需求的所有评分历史 {req_id: [score1, score2, ...]}
+    req_first_iteration: Dict[str, int]  # 每个需求首次出现的迭代轮次 {req_id: iteration}
+    req_last_iteration: Dict[str, int]  # 每个需求最后出现的迭代轮次 {req_id: iteration}
+    req_last_clarify_iteration: Dict[str, int]  # 每个需求最后一次被评分的迭代轮次 {req_id: iteration}
 
 
 # -----------------------------
@@ -310,7 +315,7 @@ def process_single_atomic_req(
     logs: List[Dict[str, Any]],
     logs_lock: Lock,
     iteration: int,
-) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, str]]], Dict[int, int]]:
+) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, str]]], Dict[int, int], Dict[str, int], Dict[str, List[int]], Dict[str, int], Dict[str, int], Dict[str, int]]:
     """
     处理单个原子需求的完整流程（ReqExplore <-> ReqClarify 迭代循环）。
     
@@ -325,10 +330,16 @@ def process_single_atomic_req(
         iteration: 当前迭代轮数
     
     Returns:
-        (normalized_reqs, explore_history, scores_count):
-        - normalized_reqs: 该原子需求处理后的细化需求列表
+        (normalized_reqs, explore_history, scores_count, req_max_scores, req_scores_history, 
+         req_first_iteration, req_last_iteration, req_last_clarify_iteration):
+        - normalized_reqs: 该原子需求处理后的细化需求列表（包含 iteration 和 score_in_iteration 字段）
         - explore_history: 该原子需求的对话历史
         - scores_count: 该原子需求的打分次数
+        - req_max_scores: 该原子需求的需求历史最高分
+        - req_scores_history: 该原子需求的需求评分历史
+        - req_first_iteration: 该原子需求的需求首次出现迭代
+        - req_last_iteration: 该原子需求的需求最后出现迭代
+        - req_last_clarify_iteration: 该原子需求的需求最后评分迭代
     """
     llm_explore = get_llm_for("ReqExplore")
     llm_clarify = get_llm_for("ReqClarify")
@@ -340,6 +351,13 @@ def process_single_atomic_req(
     scores_count = 0
     normalized_reqs: List[Dict[str, Any]] = []
     scores: Dict[str, int] = {}
+    
+    # 初始化跟踪数据结构
+    req_max_scores: Dict[str, int] = {}
+    req_scores_history: Dict[str, List[int]] = {}
+    req_first_iteration: Dict[str, int] = {}
+    req_last_iteration: Dict[str, int] = {}
+    req_last_clarify_iteration: Dict[str, int] = {}
     
     # 构建系统提示词（ReqExplore）
     system_template_explore = """你是"软件工程需求挖掘智能体"，一名资深软件需求工程师与业务闭环设计专家。你的任务是：
@@ -428,6 +446,7 @@ def process_single_atomic_req(
         
         # 规范化输出
         normalized_reqs = []
+        current_iteration = scores_count  # 当前迭代轮次（从0开始）
         if isinstance(parsed, list):
             req_id_counter = 1
             for item in parsed:
@@ -441,13 +460,46 @@ def process_single_atomic_req(
                         req_id = original_id
                     req_text = str(item.get("text", item.get("content", ""))).strip()
                     if req_text:
-                        normalized_reqs.append({"id": req_id, "text": req_text, "atomic_req_index": atomic_req_index})
+                        normalized_reqs.append({
+                            "id": req_id, 
+                            "text": req_text, 
+                            "atomic_req_index": atomic_req_index,
+                            "iteration": current_iteration,
+                            "score_in_iteration": None  # 将在评分后更新
+                        })
+                        # 记录需求首次和最后出现的迭代轮次
+                        if req_id not in req_first_iteration:
+                            req_first_iteration[req_id] = current_iteration
+                        req_last_iteration[req_id] = current_iteration
                         req_id_counter += 1
                 elif isinstance(item, str):
                     if item.strip():
                         req_id = f"A{atomic_req_index}-REQ-{req_id_counter:03d}"
-                        normalized_reqs.append({"id": req_id, "text": item.strip(), "atomic_req_index": atomic_req_index})
+                        normalized_reqs.append({
+                            "id": req_id, 
+                            "text": item.strip(), 
+                            "atomic_req_index": atomic_req_index,
+                            "iteration": current_iteration,
+                            "score_in_iteration": None  # 将在评分后更新
+                        })
+                        # 记录需求首次和最后出现的迭代轮次
+                        if req_id not in req_first_iteration:
+                            req_first_iteration[req_id] = current_iteration
+                        req_last_iteration[req_id] = current_iteration
                         req_id_counter += 1
+        
+        # 打印生成的细化需求列表
+        if normalized_reqs:
+            log(f"[ReqExplore] 原子需求 {atomic_req_index + 1} 第 {scores_count + 1} 次迭代生成细化需求：")
+            for req in normalized_reqs:
+                req_id = req.get("id", "")
+                req_text = req.get("text", "")
+                # 截断长文本（超过200字符）
+                if len(req_text) > 200:
+                    req_text_display = req_text[:200] + "..."
+                else:
+                    req_text_display = req_text
+                log(f"  - ID: {req_id}, 文本: {req_text_display}")
         
         if not normalized_reqs:
             log(f"原子需求 {atomic_req_index + 1} 无细化需求，跳过评分")
@@ -460,14 +512,13 @@ def process_single_atomic_req(
         ]
         req_list_json = json.dumps(req_list_for_scoring, ensure_ascii=False)
         
-        user_clarify = f"""【需求清单】
-```json
-{req_list_json}
-```
-
-【基准 SRS】
+        user_clarify = f"""【基准 SRS】
 ```text
 {reference_srs}
+```
+【需求清单】
+```json
+{req_list_json}
 ```
 """
         
@@ -491,6 +542,7 @@ def process_single_atomic_req(
         
         # 规范化评分
         scores = {}
+        scored_req_ids = set()  # 记录本次被评分的需求ID
         for item in evaluations:
             rid = str(item.get("id"))
             sc_val = item.get("score")
@@ -500,6 +552,45 @@ def process_single_atomic_req(
                 continue
             if rid:
                 scores[rid] = sc
+                scored_req_ids.add(rid)
+                # 更新评分历史
+                if rid not in req_scores_history:
+                    req_scores_history[rid] = []
+                req_scores_history[rid].append(sc)
+                # 更新历史最高分
+                if rid not in req_max_scores or sc > req_max_scores[rid]:
+                    req_max_scores[rid] = sc
+                # 记录最后一次被评分的迭代轮次
+                req_last_clarify_iteration[rid] = current_iteration
+                # 更新当前迭代中该需求的评分
+                for req in normalized_reqs:
+                    if req.get("id") == rid:
+                        req["score_in_iteration"] = sc
+                        break
+        
+        # 打印评分结果
+        if scores:
+            log(f"[ReqClarify] 原子需求 {atomic_req_index + 1} 第 {scores_count + 1} 次迭代评分结果：")
+            for item in evaluations:
+                rid = str(item.get("id", ""))
+                sc_val = item.get("score")
+                reason = item.get("reason", "")
+                try:
+                    sc = int(sc_val)
+                    # 格式化评分为 +2, +1, 0, -1, -2
+                    score_str = f"+{sc}" if sc > 0 else str(sc)
+                    if reason:
+                        # 截断长原因（超过100字符）
+                        reason_display = reason[:100] + "..." if len(reason) > 100 else reason
+                        log(f"  - ID: {rid}, 评分: {score_str}, 原因: {reason_display}")
+                    else:
+                        log(f"  - ID: {rid}, 评分: {score_str}")
+                except Exception:
+                    continue
+        
+        # 对于在 normalized_reqs 中但未在 evaluations 中出现的需求，
+        # 不更新 req_last_clarify_iteration，这样在 aggregate_node 中可以识别为"未被评分"
+        # 注意：这些需求可能因为 LLM 输出不完整等原因未被评分
         
         scores_count += 1
         
@@ -519,7 +610,9 @@ def process_single_atomic_req(
     
     log(f"原子需求 {atomic_req_index + 1} 处理完成，共迭代 {scores_count} 次，生成 {len(normalized_reqs)} 条细化需求")
     
-    return normalized_reqs, {atomic_req_index: explore_history}, {atomic_req_index: scores_count}
+    return (normalized_reqs, {atomic_req_index: explore_history}, {atomic_req_index: scores_count},
+            req_max_scores, req_scores_history, req_first_iteration, req_last_iteration,
+            req_last_clarify_iteration)
 
 
 def req_parse_node(state: GraphState, llm=None) -> GraphState:
@@ -608,34 +701,72 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     messages_history = explore_history[atomic_req_index]
     
     # 构建系统提示词
-    system_template = """你是"软件工程需求挖掘智能体"，一名资深软件需求工程师与业务闭环设计专家。你的任务是：
+    system_template = """你是「软件工程需求挖掘智能体」，一名资深软件需求工程师与业务闭环设计专家。
 
-1. 输入处理：用户会提供：
-   • 【原始需求】：背景、目标、现状、限制等
-   • 【原子需求】：一条待细化的功能或规则
+【你的目标】
+将用户输入的一条【原子需求】拆解为多条可执行、可验证、覆盖闭环的需求描述，服务于「产品 / 研发 / 测试」三方协作，而不卷入具体技术实现细节。
 
-2. 输出格式：你将原子需求细化为多条结构化条目，输出一个 JSON 数组，数组每个元素包含：
+【输入说明】
+用户会提供：
+1. 【原始需求】（可选）：背景、业务目标、现状问题、约束条件等。
+2. 【原子需求】（必选）：一条待细化的功能或规则，语义相对单一，但可能包含隐含意图。
+
+【输出要求】
+1. 输出格式：仅输出一个 JSON 数组，不添加任何解释性文本。
+2. 数组中每个元素为一条独立闭环需求，结构为：
    {
      "id": "REQ-001",
      "text": "需求描述"
    }
+3. "id" 从 REQ-001 开始按顺序递增。
+4. 每条 "text" 必须是自然语言的单句或短段落，便于直接用于评审与用例设计，不拆成子条列表。
 
-3. 每条"需求描述"应自然流畅、面向产品/研发/测试三方协作，覆盖以下闭环要素（以自然语言表述，非分段）：
-   - 功能意图与使用场景
-   - 触发条件
-   - 处理逻辑
-   - 输出或系统反馈
-   - 异常处理 / 回退策略
-   - 访问控制 / 操作审计
-   - 幂等性 / 一致性要求
-   - 可观测性（如埋点、日志）
-   - 前提条件
+【单条需求描述应体现的闭环要素】
+在不生硬拆分的前提下，每条需求描述需尽可能完整体现以下内容（用连贯自然语言表达，而非罗列）：
+- 功能意图与适用场景（该能力解决什么问题，用于何种业务情境）
+- 触发条件（由谁、在何种前提或事件下触发）
+- 处理逻辑（系统应该如何响应与决策的规则）
+- 输出或系统反馈（用户或上下游系统可感知的结果）
+- 异常处理 / 回退策略（输入异常、规则冲突、依赖失败时系统应如何处理）
+- 访问控制 / 操作审计（谁有权限执行/查看，以及关键操作是否需记录）
+- 幂等性 / 一致性要求（重复触发或并发情况下的预期行为）
+- 可观测性要求（需要哪些埋点、日志、指标，便于验证与监控）
+- 前提条件（依赖的配置、数据、外部系统或业务状态）
 
-4. 每次仅针对一条【原子需求】细化生成多个子条目（每条聚焦单一闭环），避免功能堆叠。
-5. 用户会用 JSON 数组评分你的输出，如：[{"id":"REQ-001", "score":1}]，你将根据评分逐条迭代并更新。
-6. 评分规则：+2 强采纳，+1 采纳，0 中性建议，-1 不采纳，-2 强不采纳。
-7. 不输出接口字段、数据结构等技术实现，仅描述"系统应该做什么、表现为何、如何被感知验证"。
-8. 所有输出仅为 JSON 数组，无解释性语言。
+注意：
+- 每条需求描述应形成一个「自洽闭环」，而非简单拼接上述要素。
+- 同一【原子需求】可以拆解为多条子需求，每条各自闭环，避免在单条中堆叠多个不相干流程。
+- 不输出接口字段名、数据库结构、表名、具体协议等实现层细节，仅描述「系统应该做什么、表现为何、如何被感知与验证」。
+
+【拆解策略】
+1. 每次只针对一条【原子需求】进行拆解，生成多个子条目。
+2. 支持多层级挖掘：
+   - 在原子需求存在隐含前置规则、风控约束、配置入口、审核流程等时，应主动拆解为二级、三级子需求。
+3. 遇到信息缺失时，基于【原始需求】及常见行业实践进行合理补全，并保持表述为「应当」而非「也许」。
+
+【评分与自适应迭代】
+用户会基于你上一轮输出给出评分 JSON，例如：
+[
+  { "id": "REQ-001", "score": 2 },
+  { "id": "REQ-002", "score": -1 }
+]
+评分含义：
+- +2：强采纳
+- +1：采纳
+-  0：中性
+- -1：不采纳
+- -2：强不采纳
+
+当收到评分后：
+1. 仅根据对应 id 对相关需求进行增删改或重写。
+2. 总结用户偏好（如：粒度、严谨度、业务语气、保守/激进补全程度），在后续输出中自适应调整。
+3. 迭代输出时同样严格遵守「仅输出 JSON 数组」的格式要求。
+
+【全局约束】
+- 所有输出均为 JSON 数组，无额外说明文字。
+- 语言风格：清晰、具体、业务可读，避免空洞表述与技术实现细节。
+- 核心定位：面向真实业务场景的需求工程与闭环设计，而非仅做功能拆分罗列。
+
 """
     
     # 如果是首次处理，创建初始消息
@@ -716,6 +847,21 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
                     normalized_reqs.append({"id": req_id, "text": item.strip(), "atomic_req_index": atomic_req_index})
                     req_id_counter += 1
     
+    # 打印生成的细化需求列表
+    if normalized_reqs:
+        scores_count = state.get("atomic_req_scores_count", {})
+        current_scores_count = scores_count.get(atomic_req_index, 0)
+        log(f"[ReqExplore] 原子需求 {atomic_req_index + 1} 第 {current_scores_count + 1} 次迭代生成细化需求：")
+        for req in normalized_reqs:
+            req_id = req.get("id", "")
+            req_text = req.get("text", "")
+            # 截断长文本（超过200字符）
+            if len(req_text) > 200:
+                req_text_display = req_text[:200] + "..."
+            else:
+                req_text_display = req_text
+            log(f"  - ID: {req_id}, 文本: {req_text_display}")
+    
     # 将当前原子需求的细化需求合并到 req_list
     # 先移除该原子需求之前的细化需求（如果有相同 atomic_req_index 的）
     existing_req_list = state.get("req_list", [])
@@ -769,8 +915,8 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
 评分规则为5分制：强采纳 +2；采纳 +1；中性意见 0；不采纳 -1；强不采纳 -2。以基准 SRS 为唯一标尺，锚定术语、量纲、阈值、角色称谓；不得引入新需求、不得改写原文、不得扩展范围。
 
 当输入同时包含：
-- 需求清单：代码围栏，类型为 json，包含 [{"id":..., "text":...}] 数组；
 - 基准 SRS：代码围栏，类型为 text。
+- 需求清单：代码围栏，类型为 json，包含 [{"id":..., "text":...}] 数组；
 
 此时进入评分模式，仅输出一个 json 围栏包裹的评分数组，格式如：[{"id":"FR-01","score":1,"reason":"..."}]。
 
@@ -834,6 +980,26 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     scores_count[atomic_req_index] = scores_count.get(atomic_req_index, 0) + 1
     state["atomic_req_scores_count"] = scores_count
     
+    # 打印评分结果
+    if scores_map:
+        log(f"[ReqClarify] 原子需求 {atomic_req_index + 1} 第 {scores_count[atomic_req_index]} 次迭代评分结果：")
+        for item in evaluations:
+            rid = str(item.get("id", ""))
+            sc_val = item.get("score")
+            reason = item.get("reason", "")
+            try:
+                sc = int(sc_val)
+                # 格式化评分为 +2, +1, 0, -1, -2
+                score_str = f"+{sc}" if sc > 0 else str(sc)
+                if reason:
+                    # 截断长原因（超过100字符）
+                    reason_display = reason[:100] + "..." if len(reason) > 100 else reason
+                    log(f"  - ID: {rid}, 评分: {score_str}, 原因: {reason_display}")
+                else:
+                    log(f"  - ID: {rid}, 评分: {score_str}")
+            except Exception:
+                continue
+    
     log(f"ReqClarify：评分完成，当前原子需求已打分 {scores_count[atomic_req_index]} 次")
     return state
 
@@ -849,70 +1015,34 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     # 预先序列化JSON字符串用于模板填充
     effective_req_list_json = json.dumps(effective_req_list, ensure_ascii=False)
 
-    system_template = """你是软件需求规格文档生成智能体，你将把用户提供的"需求清单/用户故事/功能点与约束"等原始材料，转化为遵循 IEEE Std 830-1998 的中文《软件需求规格说明书（SRS）》。你的输出须正式、无二义、可测试，不出现"可能/大概/尽量/类似/TBD/待定"等不确定或口语化表述。若信息不足，不得提出澄清问题，不得做任何假设或猜测；在信息不足处直接标注"缺失"，并继续完成剩余部分。
+    system_template = """你将把用户提供的“需求清单、用户故事、功能点与约束”等原始材料，转化为一份正式的《软件需求规格说明书（SRS）》。文档结构严格遵循以下九节格式：
 
-—写作目标—
-1) 交付完整、结构化的 SRS（除非用户要求仅生成部分章节）。
-2) 统一术语与命名，构建可追踪、可验证、可评审的需求基线。
-3) 以数量化阈值与可操作验收标准替换所有模糊措辞。
+1. Problem Background
+2. Stakeholders
+3. Functional Requirements
+4. Performance Requirements
+5. Design Constraints
+6. External Interfaces
+7. Security Requirements
+8. Use Cases for the Application
+   • Actor
+   • Purpose
+   • Event Flow
+   • Special Conditions
+9. Glossary of Terms
 
-—输出结构（遵循 IEEE 830-1998 基本格式）—
-1. 引言（Introduction）
-  1.1 目的（Purpose）
-  1.2 范围（Scope）
-  1.3 术语、缩略语与定义（Definitions, Acronyms, Abbreviations）
-  1.4 参考资料（References）
-  1.5 文档概览（Overview）
-2. 整体描述（Overall Description）
-  2.1 产品背景（Product Perspective）
-  2.2 产品功能概述（Product Functions）
-  2.3 用户特征（User Characteristics）
-  2.4 约束（Constraints）
-  2.5 假设与依赖（Assumptions and Dependencies）
-  2.6 需求分配（Apportioning of Requirements）
-3. 具体需求（Specific Requirements）
-  3.1 外部接口需求（External Interface Requirements）
-      3.1.1 用户接口（User Interfaces）
-      3.1.2 硬件接口（Hardware Interfaces）
-      3.1.3 软件接口（Software Interfaces）
-      3.1.4 通信接口（Communications Interfaces）
-  3.2 功能性需求（Functional Requirements）
-      —以 FR-001.. 编号的分项需求表述—
-  3.3 性能需求（Performance Requirements）
-  3.4 逻辑数据库需求（Logical Database Requirements）
-  3.5 设计约束（Design Constraints）
-  3.6 软件系统属性（Software System Attributes：可靠性、可用性、安全性、可维护性、可移植性等）
-  3.7 其他需求（Other Requirements）
-4. 附录（Appendices）
-  4.1 用例/场景与活动流程（可选）
-  4.2 术语表（可选）
-  4.3 需求可追踪矩阵（Source→Requirement→Test）（可选）
-5. 索引（可选）
+输出语言正式、无二义、可测试；不得使用“可能、大概、尽量、类似、TBD、待定”等不确定或模糊表达。不得提出澄清问题、不得做假设或推测。若信息未提供，则不生成对应内容。
 
-—编号与可追踪性—
-• 采用分层编号（如 1、1.1、1.1.1）。
-• 需求标识：FR-###（功能）、NFR-PERF-###（性能）、NFR-SEC-###（安全）、NFR-REL-###（可靠性）、NFR-MAINT-###（可维护性）、NFR-PORT-###（可移植性）等。
-• 每条需求均包含：［描述］（以"系统必须/不得/应"起句，唯一且原子化）、［来源/依据］（原始清单项或"缺失"）、［验收标准］（可测试，含阈值与判定）、［优先级］（P0/P1/P2）、［依赖/冲突］（如有，"缺失"视为无）。
-• 输出"需求可追踪矩阵"：列出来源项（S-###）↔ 需求（FR/NFR）↔ 验收测试（TC-###）。若未提供测试用例，你将为每条需求给出至少 1 条可执行的高层验收标准。
+每条功能性需求应包含唯一编号与标题（如 FR-001 登录功能），正文以“系统必须”“系统不得”或“系统应”开头，确保可测试。
 
-—语言与术语—
-• 禁用不确定词：例如"可能、尽量、基本、合适、快速、用户友好、及时、稳定、等、类似、TBD、待定、如果可能、应该可以"等；改用明确阈值或清晰条件。
-• 采用 RFC 2119 风格映射：
-  "必须"= SHALL（强制），
-  "不得"= SHALL NOT（禁止），
-  "应"= SHOULD（建议，谨慎使用并给出理由），
-  "可"= MAY（允许，用于放宽且可测试的条件）。
-• 所有度量使用明确单位与边界条件（ms、s、req/s、% 等），时间与频率使用绝对数值，不使用"尽快/较好/较少"等。
+不得在任何部分提及内容“源自需求清单”或“来自输入”等信息，只呈现正式文档内容。
 
-—输入规范—
-• 接受：需求清单、用户故事、用例、界面草图的文字描述、接口字段表、非功能目标、约束/法规。
-• 不得主观推测、补全、拟造内容；所有信息必须源自用户输入。若缺失，必须显式标注"缺失"。
+语言要求：
+• 禁用含糊用词，如“可能、尽量、基本、合适、快速、用户友好、及时、稳定、等、类似、TBD、待定、如果可能、应该可以”。
+• 所有性能项和度量必须明确可测，包含单位与阈值。
+• 采用正式书面语风格，不使用表格或字段化格式。
 
-—格式化—
-• 使用清晰的标题、表格与项目编号；为矩阵使用 Markdown 表格；代码块仅用于示例数据结构（如 JSON 字段）而非叙述性文本。
-• 默认输出完整 SRS；如用户仅需部分章节或精简版，按需裁剪。
-
-你不得寻求澄清，不得提出问题，不得做任何形式的推测。
+当用户输入需求清单或描述时，你将直接生成遵循上述结构与规范的完整 SRS，不提出问题、不补写缺失、不做推测、不引用输入来源。
 """
     
     user_template = """【最终需求清单】
@@ -1042,6 +1172,11 @@ def parallel_process_atomic_reqs_node(state: GraphState) -> GraphState:
     all_reqs: List[Dict[str, Any]] = []
     all_explore_history: Dict[int, List[Dict[str, str]]] = {}
     all_scores_count: Dict[int, int] = {}
+    all_req_max_scores: Dict[str, int] = {}
+    all_req_scores_history: Dict[str, List[int]] = {}
+    all_req_first_iteration: Dict[str, int] = {}
+    all_req_last_iteration: Dict[str, int] = {}
+    all_req_last_clarify_iteration: Dict[str, int] = {}
     logs_list = state.get("logs", [])
     logs_lock = Lock()
     
@@ -1067,13 +1202,24 @@ def parallel_process_atomic_reqs_node(state: GraphState) -> GraphState:
         for future in as_completed(future_to_index):
             idx = future_to_index[future]
             try:
-                normalized_reqs, explore_history, scores_count = future.result()
+                (normalized_reqs, explore_history, scores_count,
+                 req_max_scores, req_scores_history, req_first_iteration,
+                 req_last_iteration, req_last_clarify_iteration) = future.result()
                 
                 # 线程安全地合并结果
                 with logs_lock:
                     all_reqs.extend(normalized_reqs)
                     all_explore_history.update(explore_history)
                     all_scores_count.update(scores_count)
+                    # 合并评分相关数据
+                    all_req_max_scores.update(req_max_scores)
+                    for req_id, scores in req_scores_history.items():
+                        if req_id not in all_req_scores_history:
+                            all_req_scores_history[req_id] = []
+                        all_req_scores_history[req_id].extend(scores)
+                    all_req_first_iteration.update(req_first_iteration)
+                    all_req_last_iteration.update(req_last_iteration)
+                    all_req_last_clarify_iteration.update(req_last_clarify_iteration)
                 
                 log(f"并行处理：原子需求 {idx + 1} 处理完成")
             except Exception as e:
@@ -1084,6 +1230,11 @@ def parallel_process_atomic_reqs_node(state: GraphState) -> GraphState:
     state["req_list"] = all_reqs
     state["atomic_req_explore_history"] = all_explore_history
     state["atomic_req_scores_count"] = all_scores_count
+    state["req_max_scores"] = all_req_max_scores
+    state["req_scores_history"] = all_req_scores_history
+    state["req_first_iteration"] = all_req_first_iteration
+    state["req_last_iteration"] = all_req_last_iteration
+    state["req_last_clarify_iteration"] = all_req_last_clarify_iteration
     state["logs"] = logs_list
     
     log(f"并行处理：所有原子需求处理完成，共生成 {len(all_reqs)} 条细化需求")
@@ -1091,11 +1242,86 @@ def parallel_process_atomic_reqs_node(state: GraphState) -> GraphState:
 
 
 def aggregate_node(state: GraphState) -> GraphState:
-    """汇总所有处理完的原子需求"""
+    """汇总所有处理完的原子需求，并过滤需求
+    
+    过滤规则：
+    - 相同ID的需求只保留最高分对应的版本（如果最高分 >= 0）
+    - 如果最高分 < 0 但存在未评分的新增项，保留未评分的新增项
+    """
     log("汇总：收集所有处理完的原子需求")
-    effective_req_list = state.get("req_list", [])
+    req_list = state.get("req_list", [])
+    
+    # 获取评分和迭代信息
+    req_max_scores = state.get("req_max_scores", {})
+    req_last_iteration = state.get("req_last_iteration", {})
+    req_last_clarify_iteration = state.get("req_last_clarify_iteration", {})
+    max_iterations = state.get("max_iterations", 5)
+    
+    # 最后一次迭代的索引（从0开始，所以是 max_iterations - 1）
+    last_iteration_index = max_iterations - 1
+    
+    # 按ID分组所有需求
+    reqs_by_id: Dict[str, List[Dict[str, Any]]] = {}
+    for req in req_list:
+        req_id = req.get("id", "")
+        if not req_id:
+            continue
+        if req_id not in reqs_by_id:
+            reqs_by_id[req_id] = []
+        reqs_by_id[req_id].append(req)
+    
+    # 对于每个ID，找到最高分对应的版本（如果最高分 >= 0）或未评分的新增项
+    effective_req_list = []
+    for req_id, req_versions in reqs_by_id.items():
+        max_score = req_max_scores.get(req_id, None)
+        
+        # 如果最高分 >= 0，保留最高分对应的版本
+        if max_score is not None and max_score >= 0:
+            # 找到最高分对应的版本（如果有多个，选择最新的）
+            best_req = None
+            best_iteration = -1
+            for req in req_versions:
+                score_in_iteration = req.get("score_in_iteration")
+                req_iteration = req.get("iteration", -1)
+                if score_in_iteration is not None and score_in_iteration == max_score:
+                    # 选择迭代轮次最大的（最新的）
+                    if req_iteration > best_iteration:
+                        best_req = req
+                        best_iteration = req_iteration
+            
+            # 如果没找到确切匹配的版本（可能因为评分历史记录问题），选择第一个有评分的版本
+            if best_req is None:
+                for req in req_versions:
+                    if req.get("score_in_iteration") is not None:
+                        best_req = req
+                        break
+            
+            # 如果还是没找到，选择最后一个版本（最新的）
+            if best_req is None:
+                best_req = req_versions[-1]
+            
+            if best_req:
+                effective_req_list.append(best_req)
+        else:
+            # 如果最高分 < 0 或不存在，检查是否有未评分的新增项
+            # 未评分的新增项：在最后一次迭代中出现，但最后一次被评分的迭代轮次 < 最后出现的迭代轮次
+            unrated_new_req = None
+            for req in req_versions:
+                req_iteration = req.get("iteration", -1)
+                score_in_iteration = req.get("score_in_iteration")
+                # 如果该版本在最后一次迭代中，且未被评分
+                if (req_iteration == last_iteration_index and 
+                    score_in_iteration is None and
+                    req_last_clarify_iteration.get(req_id, -1) < req_last_iteration.get(req_id, -1)):
+                    unrated_new_req = req
+                    break
+            
+            if unrated_new_req:
+                effective_req_list.append(unrated_new_req)
+    
     state["effective_req_list"] = effective_req_list
-    log(f"汇总：共收集 {len(effective_req_list)} 条需求")
+    log(f"汇总：共收集 {len(req_list)} 条需求，按ID去重后保留 {len(effective_req_list)} 条需求")
+    log(f"汇总：评分>=0的需求 {sum(1 for score in req_max_scores.values() if score is not None and score >= 0)} 条")
     return state
 
 
@@ -1190,6 +1416,11 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "srs_stream_printed": False,
         "ablation_mode": demo.ablation_mode,
         "parallel_workers": demo.parallel_workers,
+        "req_max_scores": {},
+        "req_scores_history": {},
+        "req_first_iteration": {},
+        "req_last_iteration": {},
+        "req_last_clarify_iteration": {},
     }
     config = {"recursion_limit": 1000}
     if not silent:
