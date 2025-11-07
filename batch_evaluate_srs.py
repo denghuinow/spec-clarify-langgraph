@@ -3,7 +3,7 @@
 批量SRS评分脚本
 ---------------
 读取 generated_documents.json，对每个文档调用 srs_evaluation.py 进行评估，
-并生成包含 filename、time_cost、srs得分 的 CSV 文件。
+并生成包含 filename、time_cost、comprehensive_score_simple、comprehensive_score_weighted 的 CSV 文件。
 
 使用方法:
     python batch_evaluate_srs.py
@@ -85,7 +85,8 @@ def process_single_document(
         return (idx, {
             "filename": "N/A",
             "time_cost": time_cost,
-            "srs_score": "ERROR: 缺少filename"
+            "comprehensive_score_simple": "ERROR: 缺少filename",
+            "comprehensive_score_weighted": "ERROR: 缺少filename"
         })
     
     if verbose:
@@ -102,7 +103,8 @@ def process_single_document(
         return (idx, {
             "filename": filename,
             "time_cost": time_cost,
-            "srs_score": "ERROR: 基准SRS文件不存在"
+            "comprehensive_score_simple": "ERROR: 基准SRS文件不存在",
+            "comprehensive_score_weighted": "ERROR: 基准SRS文件不存在"
         })
     
     # 读取基准SRS文件内容
@@ -115,7 +117,8 @@ def process_single_document(
         return (idx, {
             "filename": filename,
             "time_cost": time_cost,
-            "srs_score": f"ERROR: 读取基准文件失败 - {str(e)}"
+            "comprehensive_score_simple": f"ERROR: 读取基准文件失败 - {str(e)}",
+            "comprehensive_score_weighted": f"ERROR: 读取基准文件失败 - {str(e)}"
         })
     
     # 调用评估函数
@@ -131,32 +134,43 @@ def process_single_document(
         )
         eval_time = time.time() - eval_start_time
         
-        # 提取SRS得分
-        srs_score = None
-        if "Comprehensive_Score_Simple" in result:
-            srs_score = result["Comprehensive_Score_Simple"]
-        elif "Comprehensive_Score_Weighted" in result:
-            srs_score = result["Comprehensive_Score_Weighted"]
-        elif "error" in result:
-            srs_score = f"ERROR: {result.get('error', '评估失败')}"
+        # 提取两个综合评分
+        comprehensive_score_simple = None
+        comprehensive_score_weighted = None
+        
+        if "error" in result:
+            error_msg = f"ERROR: {result.get('error', '评估失败')}"
+            comprehensive_score_simple = error_msg
+            comprehensive_score_weighted = error_msg
         else:
-            # 尝试从旧格式中提取
-            if "Total_Score" in result:
-                srs_score = result["Total_Score"]
+            # 提取 Comprehensive_Score_Simple
+            if "Comprehensive_Score_Simple" in result:
+                comprehensive_score_simple = result["Comprehensive_Score_Simple"]
             else:
-                srs_score = "ERROR: 无法提取得分"
+                comprehensive_score_simple = "N/A"
+            
+            # 提取 Comprehensive_Score_Weighted
+            if "Comprehensive_Score_Weighted" in result:
+                comprehensive_score_weighted = result["Comprehensive_Score_Weighted"]
+            else:
+                comprehensive_score_weighted = "N/A"
+        
+        # 格式化输出值
+        simple_value = comprehensive_score_simple if isinstance(comprehensive_score_simple, (int, float)) else str(comprehensive_score_simple)
+        weighted_value = comprehensive_score_weighted if isinstance(comprehensive_score_weighted, (int, float)) else str(comprehensive_score_weighted)
         
         if verbose:
             with print_lock:
-                if isinstance(srs_score, (int, float)):
-                    print(f"  [{idx}/{total}] ✓ {filename}: {srs_score:.4f} (耗时: {eval_time:.2f}秒)", flush=True)
+                if isinstance(comprehensive_score_simple, (int, float)) and isinstance(comprehensive_score_weighted, (int, float)):
+                    print(f"  [{idx}/{total}] ✓ {filename}: Simple={comprehensive_score_simple:.4f}, Weighted={comprehensive_score_weighted:.4f} (耗时: {eval_time:.2f}秒)", flush=True)
                 else:
-                    print(f"  [{idx}/{total}] ✗ {filename}: {srs_score} (耗时: {eval_time:.2f}秒)", flush=True)
+                    print(f"  [{idx}/{total}] ✗ {filename}: Simple={simple_value}, Weighted={weighted_value} (耗时: {eval_time:.2f}秒)", flush=True)
         
         return (idx, {
             "filename": filename,
             "time_cost": time_cost,
-            "srs_score": srs_score if isinstance(srs_score, (int, float)) else str(srs_score)
+            "comprehensive_score_simple": simple_value,
+            "comprehensive_score_weighted": weighted_value
         })
         
     except Exception as e:
@@ -166,7 +180,8 @@ def process_single_document(
         return (idx, {
             "filename": filename,
             "time_cost": time_cost,
-            "srs_score": f"ERROR: {str(e)}"
+            "comprehensive_score_simple": f"ERROR: {str(e)}",
+            "comprehensive_score_weighted": f"ERROR: {str(e)}"
         })
 
 
@@ -249,7 +264,8 @@ def process_documents(
                 results_dict[original_idx + 1] = {
                     "filename": documents[original_idx].get("filename", "N/A"),
                     "time_cost": documents[original_idx].get("time_cost", 0.0),
-                    "srs_score": f"ERROR: 任务执行异常 - {str(e)}"
+                    "comprehensive_score_simple": f"ERROR: 任务执行异常 - {str(e)}",
+                    "comprehensive_score_weighted": f"ERROR: 任务执行异常 - {str(e)}"
                 }
                 completed += 1
     
@@ -258,8 +274,10 @@ def process_documents(
     # 按索引排序生成CSV行
     csv_rows = [results_dict[i] for i in sorted(results_dict.keys())]
     
-    # 统计成功和失败数量
-    success_count = sum(1 for row in csv_rows if isinstance(row.get("srs_score"), (int, float)))
+    # 统计成功和失败数量（两个评分都是数值才算成功）
+    success_count = sum(1 for row in csv_rows 
+                       if isinstance(row.get("comprehensive_score_simple"), (int, float)) 
+                       and isinstance(row.get("comprehensive_score_weighted"), (int, float)))
     error_count = total - success_count
     
     if verbose:
@@ -271,7 +289,7 @@ def process_documents(
     
     try:
         with open(output_csv, "w", encoding="utf-8", newline="") as f:
-            fieldnames = ["filename", "time_cost", "srs_score"]
+            fieldnames = ["filename", "time_cost", "comprehensive_score_simple", "comprehensive_score_weighted"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             
             writer.writeheader()
