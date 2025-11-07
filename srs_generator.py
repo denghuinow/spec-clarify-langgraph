@@ -2,12 +2,18 @@
 """
 Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
-流程：ReqParse -> 原子需求队列 -> 逐条处理循环（ReqExplore <-> ReqClarify）-> 汇总 -> DocGenerate -> END
+流程：ReqParse -> 并行处理所有原子需求（ReqExplore <-> ReqClarify）-> 汇总 -> DocGenerate -> END
 
 - ReqParse：自然语言 -> 原子需求字符串数组
-- ReqExplore：单条原子需求 -> 细化需求列表（支持迭代优化）
-- ReqClarify：对当前原子需求的细化需求进行评分
+- ParallelProcessAtomicReqs：并行处理所有原子需求，每个原子需求独立进行 ReqExplore <-> ReqClarify 迭代循环
+  - ReqExplore：单条原子需求 -> 细化需求列表（支持迭代优化）
+  - ReqClarify：对当前原子需求的细化需求进行评分
 - DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
+
+并行度配置：
+- 环境变量 PARALLEL_WORKERS：设置并行工作线程数
+- 命令行参数 --parallel-workers：覆盖环境变量
+- 默认值：3 个工作线程
 """
 
 from __future__ import annotations
@@ -16,6 +22,8 @@ import argparse
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -87,6 +95,32 @@ def get_agent_temperature(agent: str) -> float:
     }
     env_key = f"OPENAI_TEMP_{agent.upper()}"
     return _parse_env_float(env_key, defaults.get(agent, 0.7))
+
+
+def get_parallel_workers(default: Optional[int] = None) -> int:
+    """
+    获取并行处理的工作线程数。
+    优先级：环境变量 PARALLEL_WORKERS > 参数 default > 默认值 3
+    
+    Args:
+        default: 默认值（如果环境变量未设置）
+    
+    Returns:
+        并行工作线程数（至少为 1）
+    """
+    env_value = os.getenv("PARALLEL_WORKERS")
+    if env_value:
+        try:
+            workers = int(env_value)
+            if workers > 0:
+                return workers
+        except ValueError:
+            pass
+    
+    if default is not None and default > 0:
+        return default
+    
+    return 3  # 默认值
 
 
 def get_llm(
@@ -261,11 +295,233 @@ class GraphState(TypedDict):
     srs_output: str
     srs_stream_printed: bool
     ablation_mode: Optional[str]  # 消融实验模式：no-clarify 或 no-explore-clarify
+    parallel_workers: Optional[int]  # 并行处理的工作线程数
 
 
 # -----------------------------
 # 节点实现
 # -----------------------------
+def process_single_atomic_req(
+    atomic_req_index: int,
+    atomic_req: str,
+    user_input: str,
+    reference_srs: str,
+    max_iterations: int,
+    logs: List[Dict[str, Any]],
+    logs_lock: Lock,
+    iteration: int,
+) -> Tuple[List[Dict[str, Any]], Dict[int, List[Dict[str, str]]], Dict[int, int]]:
+    """
+    处理单个原子需求的完整流程（ReqExplore <-> ReqClarify 迭代循环）。
+    
+    Args:
+        atomic_req_index: 原子需求索引
+        atomic_req: 原子需求文本
+        user_input: 用户原始输入
+        reference_srs: 参考 SRS
+        max_iterations: 最大迭代次数
+        logs: 日志列表（用于记录）
+        logs_lock: 日志列表的锁（用于线程安全）
+        iteration: 当前迭代轮数
+    
+    Returns:
+        (normalized_reqs, explore_history, scores_count):
+        - normalized_reqs: 该原子需求处理后的细化需求列表
+        - explore_history: 该原子需求的对话历史
+        - scores_count: 该原子需求的打分次数
+    """
+    llm_explore = get_llm_for("ReqExplore")
+    llm_clarify = get_llm_for("ReqClarify")
+    
+    log(f"开始并行处理原子需求 {atomic_req_index + 1}: {atomic_req[:50]}...")
+    
+    # 初始化该原子需求的状态
+    explore_history: List[Dict[str, str]] = []
+    scores_count = 0
+    normalized_reqs: List[Dict[str, Any]] = []
+    scores: Dict[str, int] = {}
+    
+    # 构建系统提示词（ReqExplore）
+    system_template_explore = """你是"软件工程需求挖掘智能体"，一名资深软件需求工程师与业务闭环设计专家。你的任务是：
+
+1. 输入处理：用户会提供：
+   • 【原始需求】：背景、目标、现状、限制等
+   • 【原子需求】：一条待细化的功能或规则
+
+2. 输出格式：你将原子需求细化为多条结构化条目，输出一个 JSON 数组，数组每个元素包含：
+   {
+     "id": "REQ-001",
+     "text": "需求描述"
+   }
+
+3. 每条"需求描述"应自然流畅、面向产品/研发/测试三方协作，覆盖以下闭环要素（以自然语言表述，非分段）：
+   - 功能意图与使用场景
+   - 触发条件
+   - 处理逻辑
+   - 输出或系统反馈
+   - 异常处理 / 回退策略
+   - 访问控制 / 操作审计
+   - 幂等性 / 一致性要求
+   - 可观测性（如埋点、日志）
+   - 前提条件
+
+4. 每次仅针对一条【原子需求】细化生成多个子条目（每条聚焦单一闭环），避免功能堆叠。
+5. 用户会用 JSON 数组评分你的输出，如：[{"id":"REQ-001", "score":1}]，你将根据评分逐条迭代并更新。
+6. 评分规则：+2 强采纳，+1 采纳，0 中性建议，-1 不采纳，-2 强不采纳。
+7. 不输出接口字段、数据结构等技术实现，仅描述"系统应该做什么、表现为何、如何被感知验证"。
+8. 所有输出仅为 JSON 数组，无解释性语言。
+"""
+    
+    # 构建系统提示词（ReqClarify）
+    system_template_clarify = """你是"需求澄清智能体"。从验收方视角出发，对需求清单逐条依据"基准 SRS"进行评分。
+
+评分规则为5分制：强采纳 +2；采纳 +1；中性意见 0；不采纳 -1；强不采纳 -2。以基准 SRS 为唯一标尺，锚定术语、量纲、阈值、角色称谓；不得引入新需求、不得改写原文、不得扩展范围。
+
+当输入同时包含：
+- 需求清单：代码围栏，类型为 json，包含 [{"id":..., "text":...}] 数组；
+- 基准 SRS：代码围栏，类型为 text。
+
+此时进入评分模式，仅输出一个 json 围栏包裹的评分数组，格式如：[{"id":"FR-01","score":1,"reason":"..."}]。
+
+输出要求：
+- 与输入顺序完全一致；id 一一对应；
+- reason 为中文、≤50字，仅指出审计差异点（术语不一致/阈值冲突/表述含糊/无 SRS 对应等）；
+- 不提出建议、不引入修改、不输出任何非 JSON 内容。
+
+若未同时提供需求清单与 SRS，则不进入评分模式，而是提供结构化提示与输入模板。
+
+默认不追问澄清，除非缺少必要输入。输出风格应简洁、严谨、可审计。评分依据"是否与 SRS 保持一致性"为唯一标准。
+"""
+    
+    # 首次 ReqExplore
+    initial_message = {
+        "role": "user",
+        "content": f"""【原始需求】
+{user_input}
+
+【原子需求】
+{atomic_req}
+"""
+    }
+    explore_history.append(initial_message)
+    
+    # 迭代循环：ReqExplore <-> ReqClarify
+    while scores_count < max_iterations:
+        # ReqExplore 阶段
+        messages_explore = [{"role": "system", "content": system_template_explore}] + explore_history
+        parsed, raw_output = invoke_with_json_retry(llm_explore, messages_explore, max_retries=3)
+        
+        # 记录交互（线程安全）
+        entry: Dict[str, Any] = {
+            "iteration": iteration,
+            "agent": "ReqExplore",
+            "input_messages": messages_explore,
+            "raw_output": raw_output if isinstance(raw_output, str) else str(raw_output),
+            "parsed_output": parsed,
+        }
+        with logs_lock:
+            logs.append(entry)
+        
+        # 保存响应到历史
+        assistant_message = {"role": "assistant", "content": raw_output}
+        explore_history.append(assistant_message)
+        
+        # 规范化输出
+        normalized_reqs = []
+        if isinstance(parsed, list):
+            req_id_counter = 1
+            for item in parsed:
+                if isinstance(item, dict):
+                    original_id = str(item.get("id", ""))
+                    if original_id and not original_id.startswith(f"A{atomic_req_index}-"):
+                        req_id = f"A{atomic_req_index}-{original_id}"
+                    elif not original_id:
+                        req_id = f"A{atomic_req_index}-REQ-{req_id_counter:03d}"
+                    else:
+                        req_id = original_id
+                    req_text = str(item.get("text", item.get("content", ""))).strip()
+                    if req_text:
+                        normalized_reqs.append({"id": req_id, "text": req_text, "atomic_req_index": atomic_req_index})
+                        req_id_counter += 1
+                elif isinstance(item, str):
+                    if item.strip():
+                        req_id = f"A{atomic_req_index}-REQ-{req_id_counter:03d}"
+                        normalized_reqs.append({"id": req_id, "text": item.strip(), "atomic_req_index": atomic_req_index})
+                        req_id_counter += 1
+        
+        if not normalized_reqs:
+            log(f"原子需求 {atomic_req_index + 1} 无细化需求，跳过评分")
+            break
+        
+        # ReqClarify 阶段
+        req_list_for_scoring = [
+            {"id": req.get("id", ""), "text": req.get("text", req.get("content", ""))}
+            for req in normalized_reqs
+        ]
+        req_list_json = json.dumps(req_list_for_scoring, ensure_ascii=False)
+        
+        user_clarify = f"""【需求清单】
+```json
+{req_list_json}
+```
+
+【基准 SRS】
+```text
+{reference_srs}
+```
+"""
+        
+        messages_clarify = [
+            {"role": "system", "content": system_template_clarify},
+            {"role": "user", "content": user_clarify}
+        ]
+        
+        evaluations, raw_output_clarify = invoke_with_json_retry(llm_clarify, messages_clarify, max_retries=3)
+        
+        # 记录交互（线程安全）
+        entry_clarify: Dict[str, Any] = {
+            "iteration": iteration,
+            "agent": "ReqClarify",
+            "input_messages": messages_clarify,
+            "raw_output": raw_output_clarify if isinstance(raw_output_clarify, str) else str(raw_output_clarify),
+            "parsed_output": evaluations,
+        }
+        with logs_lock:
+            logs.append(entry_clarify)
+        
+        # 规范化评分
+        scores = {}
+        for item in evaluations:
+            rid = str(item.get("id"))
+            sc_val = item.get("score")
+            try:
+                sc = int(sc_val)
+            except Exception:
+                continue
+            if rid:
+                scores[rid] = sc
+        
+        scores_count += 1
+        
+        # 如果有评分反馈，添加到历史以便下次迭代
+        if scores:
+            scores_arr = [{"id": rid, "score": sc} for rid, sc in scores.items()]
+            scores_arr_json = json.dumps(scores_arr, ensure_ascii=False)
+            feedback_message = {
+                "role": "user",
+                "content": f"""【评分】
+{scores_arr_json}
+"""
+            }
+            explore_history.append(feedback_message)
+        
+        log(f"原子需求 {atomic_req_index + 1} 完成第 {scores_count} 次迭代（共生成 {len(normalized_reqs)} 条细化需求）")
+    
+    log(f"原子需求 {atomic_req_index + 1} 处理完成，共迭代 {scores_count} 次，生成 {len(normalized_reqs)} 条细化需求")
+    
+    return normalized_reqs, {atomic_req_index: explore_history}, {atomic_req_index: scores_count}
+
+
 def req_parse_node(state: GraphState, llm=None) -> GraphState:
     """ReqParse：自然语言 -> 原子需求字符串数组"""
     llm = llm or get_llm_for("ReqParse")
@@ -759,6 +1015,81 @@ def should_process_next_atomic_req(state: GraphState) -> str:
     return has_more_atomic_reqs(state)
 
 
+def parallel_process_atomic_reqs_node(state: GraphState) -> GraphState:
+    """
+    并行处理所有原子需求。
+    每个原子需求独立进行 ReqExplore <-> ReqClarify 迭代循环。
+    """
+    atomic_reqs_queue = state.get("atomic_reqs_queue", [])
+    if not atomic_reqs_queue:
+        log("并行处理：无原子需求需要处理")
+        return state
+    
+    log(f"并行处理：开始处理 {len(atomic_reqs_queue)} 个原子需求")
+    
+    # 获取并行度（从 state 中读取，如果没有则使用默认值）
+    parallel_workers = state.get("parallel_workers")
+    workers = get_parallel_workers(default=parallel_workers)
+    log(f"并行处理：使用 {workers} 个工作线程")
+    
+    # 准备共享状态（只读部分）
+    user_input = state["user_input"]
+    reference_srs = state["reference_srs"]
+    max_iterations = state.get("max_iterations", 5)
+    iteration = state.get("iteration", 0)
+    
+    # 用于线程安全的状态合并
+    all_reqs: List[Dict[str, Any]] = []
+    all_explore_history: Dict[int, List[Dict[str, str]]] = {}
+    all_scores_count: Dict[int, int] = {}
+    logs_list = state.get("logs", [])
+    logs_lock = Lock()
+    
+    # 并行处理所有原子需求
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # 提交所有任务
+        future_to_index = {
+            executor.submit(
+                process_single_atomic_req,
+                idx,
+                atomic_req,
+                user_input,
+                reference_srs,
+                max_iterations,
+                logs_list,
+                logs_lock,
+                iteration,
+            ): idx
+            for idx, atomic_req in enumerate(atomic_reqs_queue)
+        }
+        
+        # 收集结果
+        for future in as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                normalized_reqs, explore_history, scores_count = future.result()
+                
+                # 线程安全地合并结果
+                with logs_lock:
+                    all_reqs.extend(normalized_reqs)
+                    all_explore_history.update(explore_history)
+                    all_scores_count.update(scores_count)
+                
+                log(f"并行处理：原子需求 {idx + 1} 处理完成")
+            except Exception as e:
+                log(f"并行处理：原子需求 {idx + 1} 处理失败: {str(e)}")
+                # 即使失败也继续处理其他原子需求
+    
+    # 更新状态
+    state["req_list"] = all_reqs
+    state["atomic_req_explore_history"] = all_explore_history
+    state["atomic_req_scores_count"] = all_scores_count
+    state["logs"] = logs_list
+    
+    log(f"并行处理：所有原子需求处理完成，共生成 {len(all_reqs)} 条细化需求")
+    return state
+
+
 def aggregate_node(state: GraphState) -> GraphState:
     """汇总所有处理完的原子需求"""
     log("汇总：收集所有处理完的原子需求")
@@ -773,10 +1104,13 @@ def build_graph(ablation_mode: Optional[str] = None):
     
     # 添加所有节点
     graph.add_node("ReqParse", req_parse_node)
-    graph.add_node("ReqExplore", req_explore_node)
-    graph.add_node("ReqClarify", req_clarify_node)
+    graph.add_node("ParallelProcessAtomicReqs", parallel_process_atomic_reqs_node)
     graph.add_node("Aggregate", aggregate_node)
     graph.add_node("DocGenerate", doc_generate_node)
+    
+    # 保留旧节点以支持消融实验模式（如果需要串行处理）
+    graph.add_node("ReqExplore", req_explore_node)
+    graph.add_node("ReqClarify", req_clarify_node)
     
     graph.set_entry_point("ReqParse")
     
@@ -787,9 +1121,9 @@ def build_graph(ablation_mode: Optional[str] = None):
         graph.add_edge("ReqParse", "Aggregate")
         graph.add_edge("Aggregate", "DocGenerate")
     elif ablation_mode == "no-clarify":
-        # 模式：移除 ReqClarify
-        # 流程：ReqParse -> 循环处理原子需求（ReqExplore）-> Aggregate -> DocGenerate -> END
-        log("构建图结构：no-clarify 模式（跳过 ReqClarify）")
+        # 模式：移除 ReqClarify，但使用并行处理（只并行 ReqExplore）
+        # 注意：这个模式可能需要特殊处理，暂时使用串行逻辑
+        log("构建图结构：no-clarify 模式（跳过 ReqClarify，使用串行 ReqExplore）")
         graph.add_conditional_edges(
             "ReqParse",
             has_more_atomic_reqs,
@@ -802,37 +1136,11 @@ def build_graph(ablation_mode: Optional[str] = None):
         )
         graph.add_edge("Aggregate", "DocGenerate")
     else:
-        # 默认模式：完整流程
-        # 流程：ReqParse -> 循环处理原子需求（ReqExplore <-> ReqClarify）-> Aggregate -> DocGenerate -> END
-        log("构建图结构：默认模式（完整流程）")
-        
-        # 辅助节点：移动到下一个原子需求
-        def next_atomic_req_node(state: GraphState) -> GraphState:
-            """移动到下一个原子需求的辅助节点"""
-            return state
-        
-        graph.add_node("NextAtomicReq", next_atomic_req_node)
-        
-        graph.add_conditional_edges(
-            "ReqParse",
-            has_more_atomic_reqs,
-            {"ReqExplore": "ReqExplore", "Aggregate": "Aggregate"}
-        )
-        graph.add_conditional_edges(
-            "ReqExplore",
-            should_go_to_clarify,
-            {"ReqClarify": "ReqClarify", "NextAtomicReq": "NextAtomicReq"}
-        )
-        graph.add_conditional_edges(
-            "ReqClarify",
-            should_continue_explore,
-            {"ReqExplore": "ReqExplore", "NextAtomicReq": "NextAtomicReq"}
-        )
-        graph.add_conditional_edges(
-            "NextAtomicReq",
-            should_process_next_atomic_req,
-            {"ReqExplore": "ReqExplore", "Aggregate": "Aggregate"}
-        )
+        # 默认模式：完整流程（并行处理）
+        # 流程：ReqParse -> ParallelProcessAtomicReqs -> Aggregate -> DocGenerate -> END
+        log("构建图结构：默认模式（完整流程，并行处理所有原子需求）")
+        graph.add_edge("ReqParse", "ParallelProcessAtomicReqs")
+        graph.add_edge("ParallelProcessAtomicReqs", "Aggregate")
         graph.add_edge("Aggregate", "DocGenerate")
     
     graph.add_edge("DocGenerate", END)
@@ -845,6 +1153,9 @@ class DemoInput(BaseModel):
     max_iterations: int = 5
     ablation_mode: Optional[str] = Field(
         default=None, description="消融实验模式：no-clarify 或 no-explore-clarify"
+    )
+    parallel_workers: Optional[int] = Field(
+        default=None, description="并行处理的工作线程数（None 表示使用环境变量或默认值）"
     )
 
 
@@ -878,6 +1189,7 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "srs_output": "",
         "srs_stream_printed": False,
         "ablation_mode": demo.ablation_mode,
+        "parallel_workers": demo.parallel_workers,
     }
     config = {"recursion_limit": 1000}
     if not silent:
@@ -935,6 +1247,13 @@ def main() -> None:
         default=None,
         help="消融实验模式：no-clarify（移除需求澄清智能体）或 no-explore-clarify（移除需求挖掘+澄清智能体）",
     )
+    # 5) 并行处理工作线程数
+    parser.add_argument(
+        "--parallel-workers",
+        type=int,
+        default=None,
+        help="并行处理的工作线程数（默认使用环境变量 PARALLEL_WORKERS 或默认值 3）",
+    )
 
     args = parser.parse_args()
 
@@ -968,6 +1287,7 @@ def main() -> None:
         reference_srs=reference_srs_text,
         max_iterations=args.max_iterations,
         ablation_mode=args.ablation_mode,
+        parallel_workers=args.parallel_workers,
     )
     run_demo(demo)
 
