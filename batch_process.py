@@ -148,7 +148,7 @@ class BatchProcessor:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=600
             )
             
             if result.returncode == 0:
@@ -250,7 +250,7 @@ class BatchProcessor:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=180
+                timeout=600
             )
             
             if result.returncode != 0:
