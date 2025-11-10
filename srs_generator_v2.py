@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -189,21 +190,21 @@ def extract_first_json(text: str) -> Any:
 
 
 def invoke_with_json_retry(
-    llm: ChatOpenAI, messages: List[Dict[str, str]], max_retries: int = 3
+    llm: ChatOpenAI, messages: List[Dict[str, str]], max_retries: int = 5
 ) -> Tuple[Any, str]:
     """
-    调用 LLM 并自动重试 JSON 解析失败的情况
+    调用 LLM 并自动重试 JSON 解析失败和 API 调用异常的情况
 
     Args:
         llm: ChatOpenAI 实例
         messages: 要发送的消息列表（重试时保持完全不变）
-        max_retries: 最大重试次数（默认 3）
+        max_retries: 最大重试次数（默认 5）
 
     Returns:
         (parsed_json, raw_output): 解析后的 JSON 和原始输出
 
     Raises:
-        ValueError: 如果所有重试都失败，包含所有尝试的错误信息
+        Exception: 如果所有重试都失败，包含所有尝试的错误信息
     """
     errors: List[str] = []
 
@@ -216,24 +217,41 @@ def invoke_with_json_retry(
             parsed = extract_first_json(raw_output)
 
             if attempt > 0:
-                log(f"JSON 解析重试成功（第 {attempt + 1} 次尝试）")
+                log(f"重试成功（第 {attempt + 1} 次尝试）")
 
             return parsed, raw_output
         except ValueError as e:
-            error_msg = f"第 {attempt + 1} 次尝试失败: {str(e)}"
+            # JSON 解析错误
+            error_msg = f"第 {attempt + 1} 次尝试失败（JSON 解析错误）: {str(e)}"
             errors.append(error_msg)
 
             if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
                 log(
-                    f"JSON 解析失败，{error_msg}，将进行重试（剩余 {max_retries - attempt - 1} 次）"
+                    f"JSON 解析失败，{error_msg}，等待 {wait_time} 秒后重试（剩余 {max_retries - attempt - 1} 次）"
                 )
+                time.sleep(wait_time)
             else:
                 log(f"JSON 解析失败，{error_msg}，已达到最大重试次数")
+        except Exception as e:
+            # API 调用错误（网络、HTTP 状态码等）
+            error_type = type(e).__name__
+            error_msg = f"第 {attempt + 1} 次尝试失败（API 调用错误: {error_type}）: {str(e)}"
+            errors.append(error_msg)
+
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                log(
+                    f"API 调用失败，{error_msg}，等待 {wait_time} 秒后重试（剩余 {max_retries - attempt - 1} 次）"
+                )
+                time.sleep(wait_time)
+            else:
+                log(f"API 调用失败，{error_msg}，已达到最大重试次数")
 
     # 所有重试都失败
     all_errors = "\n".join(errors)
-    raise ValueError(
-        f"JSON 解析失败，已重试 {max_retries} 次均失败。\n"
+    raise Exception(
+        f"LLM 调用失败，已重试 {max_retries} 次均失败。\n"
         f"所有尝试的错误信息：\n{all_errors}"
     )
 
@@ -994,7 +1012,43 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     )
 
     print("\n====== 实时 Markdown SRS 输出（流式） ======\n", flush=True)
-    resp = llm.invoke(messages)
+    
+    # 流式输出重试机制
+    max_retries = 5
+    resp = None
+    errors: List[str] = []
+    
+    for attempt in range(max_retries):
+        try:
+            resp = llm.invoke(messages)
+            if attempt > 0:
+                log(f"流式输出重试成功（第 {attempt + 1} 次尝试）")
+            break
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg = f"第 {attempt + 1} 次尝试失败（API 调用错误: {error_type}）: {str(e)}"
+            errors.append(error_msg)
+            
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                log(
+                    f"流式输出 API 调用失败，{error_msg}，等待 {wait_time} 秒后重试（剩余 {max_retries - attempt - 1} 次）"
+                )
+                time.sleep(wait_time)
+                # 重新创建 stream_handler 和 llm 以重置状态
+                stream_handler = StreamingPrinter()
+                llm = get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
+            else:
+                log(f"流式输出 API 调用失败，{error_msg}，已达到最大重试次数")
+                all_errors = "\n".join(errors)
+                raise Exception(
+                    f"流式输出 LLM 调用失败，已重试 {max_retries} 次均失败。\n"
+                    f"所有尝试的错误信息：\n{all_errors}"
+                )
+    
+    if resp is None:
+        raise Exception("流式输出调用失败：未获得响应")
+    
     print("\n====== 流式输出结束 ======\n", flush=True)
 
     raw_content = resp.content

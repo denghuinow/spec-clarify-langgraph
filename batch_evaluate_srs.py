@@ -83,10 +83,10 @@ def process_single_document(
             with print_lock:
                 print(f"警告 [{idx}/{total}]: 跳过缺少filename的文档", file=sys.stderr, flush=True)
         return (idx, {
-            "filename": "N/A",
-            "time_cost": time_cost,
-            "comprehensive_score_simple": "ERROR: 缺少filename",
-            "comprehensive_score_weighted": "ERROR: 缺少filename"
+            "文件名": "N/A",
+            "srs生成耗时": time_cost,
+            "简单平均分": "ERROR: 缺少filename",
+            "加权平均分": "ERROR: 缺少filename"
         })
     
     if verbose:
@@ -101,10 +101,10 @@ def process_single_document(
             with print_lock:
                 print(f"  警告: 未找到基准SRS文件: {filename}", file=sys.stderr, flush=True)
         return (idx, {
-            "filename": filename,
-            "time_cost": time_cost,
-            "comprehensive_score_simple": "ERROR: 基准SRS文件不存在",
-            "comprehensive_score_weighted": "ERROR: 基准SRS文件不存在"
+            "文件名": filename,
+            "srs生成耗时": time_cost,
+            "简单平均分": "ERROR: 基准SRS文件不存在",
+            "加权平均分": "ERROR: 基准SRS文件不存在"
         })
     
     # 读取基准SRS文件内容
@@ -115,10 +115,10 @@ def process_single_document(
             with print_lock:
                 print(f"  错误: 读取基准SRS文件失败: {e}", file=sys.stderr, flush=True)
         return (idx, {
-            "filename": filename,
-            "time_cost": time_cost,
-            "comprehensive_score_simple": f"ERROR: 读取基准文件失败 - {str(e)}",
-            "comprehensive_score_weighted": f"ERROR: 读取基准文件失败 - {str(e)}"
+            "文件名": filename,
+            "srs生成耗时": time_cost,
+            "简单平均分": f"ERROR: 读取基准文件失败 - {str(e)}",
+            "加权平均分": f"ERROR: 读取基准文件失败 - {str(e)}"
         })
     
     # 调用评估函数
@@ -167,10 +167,10 @@ def process_single_document(
                     print(f"  [{idx}/{total}] ✗ {filename}: Simple={simple_value}, Weighted={weighted_value} (耗时: {eval_time:.2f}秒)", flush=True)
         
         return (idx, {
-            "filename": filename,
-            "time_cost": time_cost,
-            "comprehensive_score_simple": simple_value,
-            "comprehensive_score_weighted": weighted_value
+            "文件名": filename,
+            "srs生成耗时": time_cost,
+            "简单平均分": simple_value,
+            "加权平均分": weighted_value
         })
         
     except Exception as e:
@@ -178,10 +178,10 @@ def process_single_document(
             with print_lock:
                 print(f"  [{idx}/{total}] ✗ 错误: 评估失败 {filename}: {e}", file=sys.stderr, flush=True)
         return (idx, {
-            "filename": filename,
-            "time_cost": time_cost,
-            "comprehensive_score_simple": f"ERROR: {str(e)}",
-            "comprehensive_score_weighted": f"ERROR: {str(e)}"
+            "文件名": filename,
+            "srs生成耗时": time_cost,
+            "简单平均分": f"ERROR: {str(e)}",
+            "加权平均分": f"ERROR: {str(e)}"
         })
 
 
@@ -262,10 +262,10 @@ def process_documents(
                     with print_lock:
                         print(f"  错误: 任务执行异常 [{original_idx + 1}/{total}]: {e}", file=sys.stderr, flush=True)
                 results_dict[original_idx + 1] = {
-                    "filename": documents[original_idx].get("filename", "N/A"),
-                    "time_cost": documents[original_idx].get("time_cost", 0.0),
-                    "comprehensive_score_simple": f"ERROR: 任务执行异常 - {str(e)}",
-                    "comprehensive_score_weighted": f"ERROR: 任务执行异常 - {str(e)}"
+                    "文件名": documents[original_idx].get("filename", "N/A"),
+                    "srs生成耗时": documents[original_idx].get("time_cost", 0.0),
+                    "简单平均分": f"ERROR: 任务执行异常 - {str(e)}",
+                    "加权平均分": f"ERROR: 任务执行异常 - {str(e)}"
                 }
                 completed += 1
     
@@ -276,8 +276,8 @@ def process_documents(
     
     # 统计成功和失败数量（两个评分都是数值才算成功）
     success_count = sum(1 for row in csv_rows 
-                       if isinstance(row.get("comprehensive_score_simple"), (int, float)) 
-                       and isinstance(row.get("comprehensive_score_weighted"), (int, float)))
+                       if isinstance(row.get("简单平均分"), (int, float)) 
+                       and isinstance(row.get("加权平均分"), (int, float)))
     error_count = total - success_count
     
     if verbose:
@@ -289,7 +289,7 @@ def process_documents(
     
     try:
         with open(output_csv, "w", encoding="utf-8", newline="") as f:
-            fieldnames = ["filename", "time_cost", "comprehensive_score_simple", "comprehensive_score_weighted"]
+            fieldnames = ["文件名", "srs生成耗时", "简单平均分", "加权平均分"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             
             writer.writeheader()
@@ -327,7 +327,8 @@ def main() -> None:
 
 环境变量:
   OPENAI_API_KEY: OpenAI API密钥（必需）
-  OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini）
+  OPENAI_EVALUATION_MODEL: 评估使用的模型名称（可选，优先使用，如果未设置则使用 OPENAI_MODEL）
+  OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini，当 OPENAI_EVALUATION_MODEL 未设置时使用）
   OPENAI_BASE_URL: API基础URL（可选，用于兼容其他OpenAI兼容的API）
         """
     )

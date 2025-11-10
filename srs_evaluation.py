@@ -11,7 +11,8 @@ SRS评分工具
     
 环境变量：
     OPENAI_API_KEY: OpenAI API密钥（必需）
-    OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini）
+    OPENAI_EVALUATION_MODEL: 评估使用的模型名称（可选，优先使用，如果未设置则使用 OPENAI_MODEL）
+    OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini，当 OPENAI_EVALUATION_MODEL 未设置时使用）
     OPENAI_BASE_URL: API基础URL（可选，用于兼容其他OpenAI兼容的API）
     
 注意：批量处理请使用 batch_process.py
@@ -140,7 +141,8 @@ def evaluate_srs(
         client_kwargs["base_url"] = base_url
     
     client = OpenAI(**client_kwargs)
-    model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    # 优先使用 OPENAI_EVALUATION_MODEL，如果未设置则回退到 OPENAI_MODEL
+    model = model or os.environ.get("OPENAI_EVALUATION_MODEL") or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     
     prompt = f"""
     只输出 JSON
@@ -151,29 +153,72 @@ def evaluate_srs(
 {evaluated_srs}
 """
     system_prompt = """
-    你是一名需求评审助手。以“基准需求文档”为真值，对照评审“用户提供的需求”的覆盖与完整度；输出可追溯矩阵（RTM）、评分指标与缺口清单，并给出可执行改进建议。输入不全时，先给部分结果并标注缺失信息。默认中文、客观简洁、用表格与要点展示。
+你是一名严格的SRS需求评审打分助手。
 
-评分内容：
-• 覆盖率（coverage）=（完全 + 0.5×部分覆盖）/ 基准条目总数。
-• 完整度（completeness）：考虑异常流程、边界条件、验收标准、数据/合规性等。
-• 一致性（consistency）：用户需求间是否自洽，与基准是否矛盾。
-• 可验证性（testability）：是否具备验收标准、可测量条件。
-• 明确性（clarity）：是否使用模糊/主观表述；是否复合。
-• 可追溯性（traceability）：用户条目是否能对应回基准。
-• 范围管理（scope_discipline）：标记范围外新增或漂浮条目。
-• 所有评分均支持分类输出：functional / non_functional / constraints。
+任务：以“基准需求文档”为真值，对“用户需求文档”进行比对，只输出结构化分数 JSON，不输出任何说明文字、表格、代码块或多余字段。
 
-支持识别：完全/部分/未覆盖、冲突、模糊、重复、范围外新增；并识别质量红旗（模糊词、复合需求、不可测试）。
+评分要求（均为 0~1 浮点数，保留 4 位以内精度即可）：
 
-输出内容：默认提供【摘要】【评分指标】【可追溯矩阵RTM】【缺口清单】【改写建议】；用户若要求“只输出 JSON”，则仅输出结构化评分与映射结构。
+1. coverage（覆盖率）
+   定义：基准需求中被用户需求“完全覆盖”的条目计 1 分，“部分覆盖”计 0.5 分，“未覆盖”计 0 分；
+   coverage = (完全覆盖条目数 + 0.5 × 部分覆盖条目数) / 基准条目总数。
 
-交互规则：接受两段输入：①基准需求文档（真值）②用户需求。若只提供其一，也先分析可用内容并说明缺失。支持编号/标题/关键字比对；RTM 用 Markdown 表输出。
+2. completeness（完整度）
+   维度：是否覆盖主要主流程、关键异常流程、边界条件、数据与状态、验收标准、合规/安全等。
+   高分表示“对已覆盖功能写得足够细致可用”。
 
-质量建议：输出可测试标准（如 Given-When-Then）、改写示例，标出模糊处与澄清建议。不编造内容，明确上下文假设与不确定性边界。
+3. consistency（一致性）
+   维度：用户需求内部是否自洽，是否与基准需求存在冲突或自相矛盾描述。
+   高分表示“无或极少明显冲突”。
 
-JSON 输出结构：
-{"metrics":{"coverage":0.85,"completeness":0.76,"consistency":0.92,"testability":0.67,"clarity":0.75,"traceability":0.9,"scope_discipline":0.8,"by_category":{"functional":0.85,"non_functional":0.6,"constraints":1.0}},"gaps":[{"baseline_id":"FR-01","issue":"partial","reason":"缺少异常流程","next_step":"补充退货失败场景","owner":"产品","priority":"P1"}],"rtm":[{"baseline_id":"FR-01","baseline_text":"用户可发起退货申请","matches":[{"user_ref":"2.1","snippet":"支持用户提交退货请求","status":"partial"}],"notes":"缺少边界与异常处理"}]}
-    """
+4. testability（可验证性）
+   维度：需求是否可被验证（是否有清晰触发条件、期望结果、可测量标准，避免不可验证的笼统词语）。
+   高分表示“绝大多数条目可据此设计测试用例”。
+
+5. clarity（明确性）
+   维度：是否存在“快速”“合理”“友好”“尽可能”等模糊主观描述，是否有复合需求或歧义。
+   高分表示“表述清晰、粒度合适、歧义少”。
+
+6. traceability（可追溯性）
+   维度：用户需求是否能有清晰映射回基准需求（编号/标题/语义），是否易于构建RTM（需求追溯矩阵）。
+   高分表示“大部分需求都能清楚对应来源”。
+
+7. scope_discipline（范围管理）
+   维度：是否大量引入超出基准范围的需求导致范围失控；是否对新增范围有清晰边界。
+   高分表示“范围收敛良好，新增点少且清楚标边界”。
+
+8. by_category（按类别得分）
+   - functional：功能性需求整体质量（以上指标在功能需求子集上的综合表现）。
+   - non_functional：非功能性需求（性能、安全、可靠性、可用性等）相关质量。
+   - constraints：约束/接口/合规等强制性条目的覆盖与清晰度。
+
+输出格式（必须严格满足）：
+- 仅输出一个 JSON 对象，禁止输出任何 Markdown、注释、自然语言说明或代码块标记。
+- JSON 顶层键仅包含：
+  - "metrics"
+
+其中：
+"metrics" : {
+  "coverage": <float>,
+  "completeness": <float>,
+  "consistency": <float>,
+  "testability": <float>,
+  "clarity": <float>,
+  "traceability": <float>,
+  "scope_discipline": <float>,
+  "by_category": {
+    "functional": <float>,
+    "non_functional": <float>,
+    "constraints": <float>
+  }
+}
+
+约束：
+- 不输出 RTM、不输出 gaps、不输出改写建议、不输出 Summary，不添加任何其他字段。
+- 若信息不足，请在分数中如实体现不确定性（给出保守分数），但仍然必须返回完整的上述字段，禁止输出解释文字。
+- 确保返回值是合法 JSON（双引号、逗号位置、布尔/数值格式均正确）。
+"""
+
     response = client.chat.completions.create(
         model=model,
         messages=[
@@ -265,7 +310,8 @@ def main() -> None:
   
 环境变量：
   OPENAI_API_KEY: OpenAI API密钥（必需）
-  OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini）
+  OPENAI_EVALUATION_MODEL: 评估使用的模型名称（可选，优先使用，如果未设置则使用 OPENAI_MODEL）
+  OPENAI_MODEL: 使用的模型名称（可选，默认: gpt-4o-mini，当 OPENAI_EVALUATION_MODEL 未设置时使用）
   OPENAI_BASE_URL: API基础URL（可选，用于兼容其他OpenAI兼容的API）
   
 注意：批量处理请使用 batch_process.py
@@ -301,7 +347,7 @@ def main() -> None:
         "--model",
         type=str,
         default=None,
-        help="使用的模型名称（可选，默认从环境变量 OPENAI_MODEL 读取）"
+        help="使用的模型名称（可选，默认从环境变量 OPENAI_EVALUATION_MODEL 或 OPENAI_MODEL 读取）"
     )
     parser.add_argument(
         "--temperature",
