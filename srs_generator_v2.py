@@ -291,6 +291,9 @@ def record_llm_interaction(
     # 根据日志级别决定打印详细内容还是简化摘要
     current_level = get_log_level()
     
+    # 特殊处理：DocGenerate 不打印文档内容，只打印摘要
+    is_doc_generate = agent == "DocGenerate"
+    
     if current_level == LOG_LEVEL_DEBUG:
         # DEBUG 级别：打印完整的输入消息和输出
         pretty_messages = json.dumps(messages, ensure_ascii=False, indent=2)
@@ -299,7 +302,12 @@ def record_llm_interaction(
             pretty_parsed = json.dumps(parsed_output, ensure_ascii=False, indent=2)
             log_debug(f"{agent}（第 {iteration} 轮）输出（解析后）：\n{pretty_parsed}")
         else:
-            log_debug(f"{agent}（第 {iteration} 轮）输出（原始）：\n{raw_text}")
+            if is_doc_generate:
+                # DocGenerate：只打印摘要，不打印文档内容
+                output_length = len(raw_text)
+                log_debug(f"{agent}（第 {iteration} 轮）输出（原始）：文档已生成，长度 {output_length} 字符")
+            else:
+                log_debug(f"{agent}（第 {iteration} 轮）输出（原始）：\n{raw_text}")
     else:
         # INFO 级别：只打印简化摘要
         # 统计输入消息信息
@@ -331,17 +339,25 @@ def record_llm_interaction(
                 for item in parsed_output:
                     rid = str(item.get("id", ""))
                     sc_val = item.get("score")
+                    reason = str(item.get("reason", "")).strip()
                     try:
                         sc = int(sc_val)
                         # 格式化评分为 +2, +1, 0, -1, -2
                         score_str = f"+{sc}" if sc > 0 else str(sc)
-                        log_info(f"  - ID: {rid}, 评分: {score_str}")
+                        if reason:
+                            log_info(f"  - ID: {rid}, 评分: {score_str}, 理由: {reason}")
+                        else:
+                            log_info(f"  - ID: {rid}, 评分: {score_str}")
                     except Exception:
                         continue
         else:
             output_length = len(raw_text)
             if output_length > 0:
-                output_summary = f"原始输出长度 {output_length} 字符"
+                if is_doc_generate:
+                    # DocGenerate：只打印摘要，不打印文档内容
+                    output_summary = f"文档已生成，长度 {output_length} 字符"
+                else:
+                    output_summary = f"原始输出长度 {output_length} 字符"
             else:
                 output_summary = "原始输出为空"
             log_info(f"{agent}（第 {iteration} 轮）输出（原始）：{output_summary}")
@@ -705,17 +721,17 @@ When the input contains both of the following:
 
 Enter scoring mode and output exactly one ```json``` fence containing the score array, for example:
 ```json
-[{"id":"FR-01","score":"+1"}]
+[{"id":"FR-01","score":"+1","reason":"..."}]
 ```
 
 [Output Requirements]
 
 - Output exactly one JSON array and wrap it inside a `json` fence.
 - Preserve the order of the input requirement list and match each id precisely.
-- Each item must contain only two fields:
+- Each item must contain three fields:
   - id: return as-is.
   - score: string value chosen from {"+2", "+1", "0", "-1", "-2"}.
-- **No reason field is needed**; return only id and score to reduce noise and save tokens.
+  - reason: a concise and auditable explanation (≤50 characters) for the score.
 - Do not provide suggestions, guidance, explanations, or any text outside the JSON.
 
 [Non-Scoring Mode]
@@ -1136,11 +1152,15 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
         for item in evaluations:
             rid = str(item.get("id", ""))
             sc_val = item.get("score")
+            reason = str(item.get("reason", "")).strip()
             try:
                 sc = int(sc_val)
                 # 格式化评分为 +2, +1, 0, -1, -2
                 score_str = f"+{sc}" if sc > 0 else str(sc)
-                log(f"  - ID: {rid}, 评分: {score_str}")
+                if reason:
+                    log(f"  - ID: {rid}, 评分: {score_str}, 理由: {reason}")
+                else:
+                    log(f"  - ID: {rid}, 评分: {score_str}")
             except Exception:
                 continue
     
@@ -1173,9 +1193,8 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
 
 def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     start_time = time.time()
-    log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
-    stream_handler = StreamingPrinter()
-    llm = llm or get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
+    log("DocGenerate：生成最终 Markdown SRS 文档（文档生成开始）")
+    llm = llm or get_llm_for("DocGenerate", streaming=False)
 
     # 使用 effective_req_list，如果没有则使用 req_list
     effective_req_list = state.get("effective_req_list", state.get("req_list", []))
@@ -1224,17 +1243,7 @@ When the user supplies a requirement list or description, immediately generate t
         {"role": "user", "content": user}
     ]
 
-    record_llm_interaction(
-        state,
-        agent="DocGenerate",
-        iteration=state["iteration"],
-        messages=messages,
-        raw_output=None,
-    )
-
-    print("\n====== 实时 Markdown SRS 输出（流式） ======\n", flush=True)
-    
-    # 流式输出重试机制
+    # 调用 LLM 并重试机制
     max_retries = 5
     resp = None
     errors: List[str] = []
@@ -1243,7 +1252,7 @@ When the user supplies a requirement list or description, immediately generate t
         try:
             resp = llm.invoke(messages)
             if attempt > 0:
-                log(f"流式输出重试成功（第 {attempt + 1} 次尝试）")
+                log(f"文档生成重试成功（第 {attempt + 1} 次尝试）")
             break
         except Exception as e:
             error_type = type(e).__name__
@@ -1253,24 +1262,21 @@ When the user supplies a requirement list or description, immediately generate t
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 log(
-                    f"流式输出 API 调用失败，{error_msg}，等待 {wait_time} 秒后重试（剩余 {max_retries - attempt - 1} 次）"
+                    f"文档生成 API 调用失败，{error_msg}，等待 {wait_time} 秒后重试（剩余 {max_retries - attempt - 1} 次）"
                 )
                 time.sleep(wait_time)
-                # 重新创建 stream_handler 和 llm 以重置状态
-                stream_handler = StreamingPrinter()
-                llm = get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
+                # 重新创建 llm 以重置状态
+                llm = get_llm_for("DocGenerate", streaming=False)
             else:
-                log(f"流式输出 API 调用失败，{error_msg}，已达到最大重试次数")
+                log(f"文档生成 API 调用失败，{error_msg}，已达到最大重试次数")
                 all_errors = "\n".join(errors)
                 raise Exception(
-                    f"流式输出 LLM 调用失败，已重试 {max_retries} 次均失败。\n"
+                    f"文档生成 LLM 调用失败，已重试 {max_retries} 次均失败。\n"
                     f"所有尝试的错误信息：\n{all_errors}"
                 )
     
     if resp is None:
-        raise Exception("流式输出调用失败：未获得响应")
-    
-    print("\n====== 流式输出结束 ======\n", flush=True)
+        raise Exception("文档生成调用失败：未获得响应")
 
     raw_content = resp.content
     full_text = (
@@ -1282,16 +1288,24 @@ When the user supplies a requirement list or description, immediately generate t
             else str(raw_content) or ""
         )
     )
-    if not full_text:
-        full_text = stream_handler.get_text()
 
     state["srs_output"] = full_text
-    state["srs_stream_printed"] = True
+    state["srs_stream_printed"] = False
+    
+    # 记录 LLM 交互（传入 raw_output，但会在 record_llm_interaction 中过滤打印）
+    record_llm_interaction(
+        state,
+        agent="DocGenerate",
+        iteration=state["iteration"],
+        messages=messages,
+        raw_output=full_text,
+    )
+    
     # 记录耗时
     elapsed = time.time() - start_time
     state.setdefault("agent_timings", {})
     state["agent_timings"]["DocGenerate"] = state["agent_timings"].get("DocGenerate", 0.0) + elapsed
-    log(f"DocGenerate：流式输出完成，耗时 {elapsed:.2f} 秒")
+    log(f"DocGenerate：文档生成完成，耗时 {elapsed:.2f} 秒")
     return state
 
 
@@ -1315,8 +1329,8 @@ def aggregate_node(state: GraphState) -> GraphState:
     """汇总全局需求，并过滤需求
     
     过滤规则：
-    - 仅保留历史最高分 >= +1 的版本
-    - 0 分视为"过程态，需要澄清"，不进最终清单
+    - 仅保留历史最高分 >= 0 的版本
+    - 0 分也会进入最终清单
     - 负分在 Clarify 后直接剪掉，不会进入 Aggregate
     """
     log("汇总：收集全局需求清单")
@@ -1335,13 +1349,13 @@ def aggregate_node(state: GraphState) -> GraphState:
             reqs_by_id[req_id] = []
         reqs_by_id[req_id].append(req)
     
-    # 对于每个ID，仅保留历史最高分 >= +1 的版本
+    # 对于每个ID，仅保留历史最高分 >= 0 的版本
     effective_req_list = []
     for req_id, req_versions in reqs_by_id.items():
         max_score = req_max_scores.get(req_id, None)
         
-        # 仅保留历史最高分 >= +1 的版本
-        if max_score is not None and max_score >= 1:
+        # 仅保留历史最高分 >= 0 的版本
+        if max_score is not None and max_score >= 0:
             # 找到最高分对应的版本（如果有多个，选择最新的）
             best_req = None
             best_iteration = -1
@@ -1367,12 +1381,144 @@ def aggregate_node(state: GraphState) -> GraphState:
             
             if best_req:
                 effective_req_list.append(best_req)
-        # 0 分和负分都不进入最终清单（0 分视为过程态，负分已在 Clarify 中移除）
+        # 负分已在 Clarify 中移除，0 分及以上都会进入最终清单
     
     state["effective_req_list"] = effective_req_list
-    log(f"汇总：共收集 {len(req_list)} 条需求，按ID去重后保留 {len(effective_req_list)} 条需求（仅保留历史最高分 >= +1）")
-    log(f"汇总：评分>=1的需求 {sum(1 for score in req_max_scores.values() if score is not None and score >= 1)} 条")
+    log(f"汇总：共收集 {len(req_list)} 条需求，按ID去重后保留 {len(effective_req_list)} 条需求（仅保留历史最高分 >= 0）")
+    log(f"汇总：评分>=0的需求 {sum(1 for score in req_max_scores.values() if score is not None and score >= 0)} 条")
     return state
+
+
+def generate_score_change_report(state: GraphState) -> None:
+    """生成完整的得分变化报告，显示每个需求的完整得分历史轨迹和变化趋势分析"""
+    req_scores_history = state.get("req_scores_history", {})
+    req_max_scores = state.get("req_max_scores", {})
+    req_first_iteration = state.get("req_first_iteration", {})
+    req_last_clarify_iteration = state.get("req_last_clarify_iteration", {})
+    banned_ids = set(state.get("banned_ids", []))
+    
+    if not req_scores_history:
+        log("得分变化报告：无评分历史数据")
+        return
+    
+    # 收集所有需求ID（包括被禁用的）
+    all_req_ids = set(req_scores_history.keys())
+    all_req_ids.update(req_max_scores.keys())
+    
+    if not all_req_ids:
+        log("得分变化报告：无需求数据")
+        return
+    
+    # 格式化得分显示（在函数顶层定义，供所有地方使用）
+    def format_score(score: int) -> str:
+        return f"+{score}" if score > 0 else str(score)
+    
+    # 分析每个需求的得分变化趋势
+    improved_reqs: List[Tuple[str, List[int], str]] = []  # (req_id, scores, trend_desc)
+    unchanged_reqs: List[Tuple[str, List[int], str]] = []
+    declined_reqs: List[Tuple[str, List[int], str]] = []
+    single_score_reqs: List[Tuple[str, List[int], str]] = []  # 只有一次评分的需求
+    
+    for req_id in sorted(all_req_ids):
+        scores = req_scores_history.get(req_id, [])
+        if not scores:
+            continue
+        
+        max_score = req_max_scores.get(req_id, None)
+        first_iter = req_first_iteration.get(req_id, 0)
+        last_clarify_iter = req_last_clarify_iteration.get(req_id, first_iter)
+        
+        # 构建得分历史轨迹字符串
+        score_history_parts = []
+        for idx, score in enumerate(scores):
+            # 估算迭代轮次：从首次评分迭代开始，每次评分对应一次迭代
+            estimated_iter = first_iter + idx
+            score_history_parts.append(f"迭代{estimated_iter + 1}: {format_score(score)}")
+        
+        history_str = " → ".join(score_history_parts)
+        max_score_str = format_score(max_score) if max_score is not None else "N/A"
+        
+        # 分析趋势
+        if len(scores) == 1:
+            trend_desc = "仅一次评分"
+            single_score_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, {trend_desc})"))
+        else:
+            first_score = scores[0]
+            last_score = scores[-1]
+            score_diff = last_score - first_score
+            
+            if score_diff > 0:
+                trend_desc = "↑提高"
+                improved_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, 趋势: {trend_desc})"))
+            elif score_diff < 0:
+                trend_desc = "↓下降"
+                declined_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, 趋势: {trend_desc})"))
+            else:
+                # 检查中间是否有变化
+                if len(set(scores)) > 1:
+                    # 有波动但最终回到起点
+                    if max_score is not None and max_score > first_score:
+                        trend_desc = "波动后提高"
+                        improved_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, 趋势: {trend_desc})"))
+                    else:
+                        trend_desc = "波动"
+                        unchanged_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, 趋势: {trend_desc})"))
+                else:
+                    trend_desc = "→不变"
+                    unchanged_reqs.append((req_id, scores, f"{history_str} (最高分: {max_score_str}, 趋势: {trend_desc})"))
+    
+    # 生成报告
+    print("\n" + "=" * 80, flush=True)
+    print("得分变化报告", flush=True)
+    print("=" * 80 + "\n", flush=True)
+    
+    # 统计摘要
+    total_reqs = len(improved_reqs) + len(unchanged_reqs) + len(declined_reqs) + len(single_score_reqs)
+    print("【统计摘要】", flush=True)
+    print(f"  总需求数: {total_reqs}", flush=True)
+    print(f"  得分提高: {len(improved_reqs)} ({len(improved_reqs)/total_reqs*100:.1f}%)" if total_reqs > 0 else "  得分提高: 0", flush=True)
+    print(f"  得分不变: {len(unchanged_reqs)} ({len(unchanged_reqs)/total_reqs*100:.1f}%)" if total_reqs > 0 else "  得分不变: 0", flush=True)
+    print(f"  得分下降: {len(declined_reqs)} ({len(declined_reqs)/total_reqs*100:.1f}%)" if total_reqs > 0 else "  得分下降: 0", flush=True)
+    print(f"  仅一次评分: {len(single_score_reqs)} ({len(single_score_reqs)/total_reqs*100:.1f}%)" if total_reqs > 0 else "  仅一次评分: 0", flush=True)
+    if banned_ids:
+        print(f"  已禁用需求: {len(banned_ids)} 个", flush=True)
+    print("", flush=True)
+    
+    # 详细轨迹 - 按趋势分组
+    if improved_reqs:
+        print("【得分提高的需求】", flush=True)
+        for req_id, scores, desc in improved_reqs:
+            print(f"  {req_id}: {desc}", flush=True)
+        print("", flush=True)
+    
+    if unchanged_reqs:
+        print("【得分不变的需求】", flush=True)
+        for req_id, scores, desc in unchanged_reqs:
+            print(f"  {req_id}: {desc}", flush=True)
+        print("", flush=True)
+    
+    if declined_reqs:
+        print("【得分下降的需求】", flush=True)
+        for req_id, scores, desc in declined_reqs:
+            print(f"  {req_id}: {desc}", flush=True)
+        print("", flush=True)
+    
+    if single_score_reqs:
+        print("【仅一次评分的需求】", flush=True)
+        for req_id, scores, desc in single_score_reqs:
+            print(f"  {req_id}: {desc}", flush=True)
+        print("", flush=True)
+    
+    if banned_ids:
+        print("【已禁用的需求（负分）】", flush=True)
+        for req_id in sorted(banned_ids):
+            scores = req_scores_history.get(req_id, [])
+            if scores:
+                last_score = scores[-1]
+                print(f"  {req_id}: 最后得分 {format_score(last_score)} (已移除)", flush=True)
+        print("", flush=True)
+    
+    print("=" * 80 + "\n", flush=True)
 
 
 def build_graph(ablation_mode: Optional[str] = None):
@@ -1472,11 +1618,9 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
     final_state = app.invoke(init, config)
     if not silent:
         log("流程结束，输出结果")
-        if final_state["srs_stream_printed"]:
-            print("\n====== Markdown SRS 输出已通过流式打印展示 ======\n", flush=True)
-        else:
-            print("\n====== 最终 Markdown SRS 输出 ======\n", flush=True)
-            print(final_state["srs_output"], flush=True)
+        
+        # 生成得分变化报告
+        generate_score_change_report(final_state)
 
     return final_state
 

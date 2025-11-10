@@ -143,6 +143,42 @@ class BatchProcessor:
     def get_evaluation_model(self) -> str:
         """获取评估模型名称（优先使用 OPENAI_EVALUATION_MODEL，如果未设置则回退到 OPENAI_MODEL）"""
         return os.environ.get("OPENAI_EVALUATION_MODEL") or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+    
+    def _calculate_generation_time_excluding_clarify(
+        self, 
+        agent_timings: Dict[str, float], 
+        total_elapsed_time: float
+    ) -> float:
+        """
+        计算排除 ReqClarify 的生成耗时
+        
+        使用 agent_timings 计算实际的智能体执行时间，排除：
+        - 文件读取时间
+        - 重试等待时间（time.sleep）
+        - ReqClarify 的耗时
+        
+        Args:
+            agent_timings: 各智能体的耗时字典
+            total_elapsed_time: 总耗时（作为兜底值）
+        
+        Returns:
+            排除 ReqClarify 的生成耗时（秒）
+        """
+        if not agent_timings:
+            # 如果没有 agent_timings，使用总耗时（向后兼容）
+            return total_elapsed_time
+        
+        # 计算所有智能体的总耗时
+        total_agent_time = sum(agent_timings.values())
+        # 排除 ReqClarify 的耗时
+        clarify_time = agent_timings.get("ReqClarify", 0.0)
+        generation_time = total_agent_time - clarify_time
+        
+        # 如果计算出的耗时小于0，使用总耗时作为兜底
+        if generation_time < 0:
+            return total_elapsed_time
+        
+        return generation_time
         
     def get_md_files(self) -> List[Path]:
         """获取用户需求目录中的所有 .md 文件"""
@@ -781,26 +817,14 @@ class BatchProcessor:
             if final_state is None:
                 raise Exception("文件处理失败：未获得最终状态")
             
-            # 计算耗时
+            # 计算总耗时（包含文件读取、重试等待等）
             elapsed_time = time.time() - start_time
             
-            # 从 final_state 获取 agent_timings，计算排除 ReqClarify 的总耗时
+            # 使用 agent_timings 计算实际的生成耗时（排除文件读取、重试等待、ReqClarify）
             agent_timings = final_state.get("agent_timings", {})
-            elapsed_time_excluding_clarify = elapsed_time
-            if agent_timings:
-                # 计算所有智能体的总耗时
-                total_agent_time = sum(agent_timings.values())
-                # 排除 ReqClarify 的耗时
-                clarify_time = agent_timings.get("ReqClarify", 0.0)
-                elapsed_time_excluding_clarify = total_agent_time - clarify_time
-                # 如果计算出的排除耗时小于0或大于总耗时，使用总耗时作为兜底
-                if elapsed_time_excluding_clarify < 0:
-                    elapsed_time_excluding_clarify = elapsed_time
-                elif elapsed_time_excluding_clarify > elapsed_time:
-                    elapsed_time_excluding_clarify = elapsed_time - clarify_time
-            else:
-                # 如果没有 agent_timings，使用总耗时（向后兼容）
-                elapsed_time_excluding_clarify = elapsed_time
+            elapsed_time_excluding_clarify = self._calculate_generation_time_excluding_clarify(
+                agent_timings, elapsed_time
+            )
             
             # 保存SRS文档
             srs_output_file = self.srs_output_dir / f"{file_basename}_srs.md"
@@ -962,8 +986,14 @@ class BatchProcessor:
             if final_state is None:
                 raise Exception("文件处理失败：未获得最终状态")
             
-            # 计算生成耗时
-            generation_elapsed_time = time.time() - start_time
+            # 计算总耗时（包含文件读取、重试等待等）
+            generation_total_time = time.time() - start_time
+            
+            # 使用 agent_timings 计算实际的生成耗时（排除文件读取、重试等待、ReqClarify）
+            agent_timings = final_state.get("agent_timings", {})
+            generation_elapsed_time = self._calculate_generation_time_excluding_clarify(
+                agent_timings, generation_total_time
+            )
             
             # 保存SRS文档
             srs_output_file = self.srs_output_dir / f"{file_basename}_srs.md"
@@ -981,7 +1011,7 @@ class BatchProcessor:
             generator_summary_entry = {
                 "文件": file_basename,
                 "状态": "success",
-                "生成耗时(秒)": round(generation_elapsed_time, 2),
+                "生成耗时(秒)": round(generation_elapsed_time, 2),  # 使用排除 ReqClarify 的耗时
                 "使用模型": self.get_generator_model(),
                 "ReqExplore迭代次数": req_explore_iterations,
                 "消融实验模式": self.ablation_mode
@@ -1068,7 +1098,9 @@ class BatchProcessor:
                 "max_iterations": self.max_iterations,
                 "ablation_mode": self.ablation_mode,
                 "final_iteration": final_state["iteration"],
-                "elapsed_time_seconds": generation_elapsed_time + evaluation_elapsed_time,
+                "elapsed_time_seconds": generation_elapsed_time,  # 排除 ReqClarify 的生成耗时
+                "elapsed_time_seconds_total": generation_total_time + evaluation_elapsed_time,  # 总耗时（包含所有开销）
+                "agent_timings": agent_timings,  # 保存各节点详细耗时
                 "req_list": final_state["req_list"],
                 "frozen_ids": frozen_ids,
                 "removed_ids": removed_ids,
