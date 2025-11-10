@@ -1038,6 +1038,13 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     state.setdefault("agent_timings", {})
     state["agent_timings"]["ReqExplore"] = state["agent_timings"].get("ReqExplore", 0.0) + elapsed
     log(f"ReqExplore：完成全局需求清单生成，共 {len(normalized_reqs)} 条需求，耗时 {elapsed:.2f} 秒")
+    
+    # 在 no-clarify 模式下，需要递增 global_iteration（因为跳过了 ReqClarify，而 ReqClarify 原本负责递增）
+    if state.get("ablation_mode") == "no-clarify":
+        current_global_iteration = state.get("global_iteration", 0)
+        state["global_iteration"] = current_global_iteration + 1
+        log(f"ReqExplore（no-clarify 模式）：递增 global_iteration 至 {state['global_iteration']}")
+    
     return state
 
 
