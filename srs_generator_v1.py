@@ -291,39 +291,39 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     current_iteration = state["iteration"] + 1
 
     user_template = (
-        '你是"需求解析智能体（ReqParse）"，负责将自然语言需求转为**原子化**的初始清单。\n'
+        'You are the "Requirement Parsing Agent (ReqParse)", responsible for converting natural language requirements into an **atomic** initial list.\n'
         "\n"
-        "【解析方法（在内部完成，不要出现在输出中）】\n"
-        "1) 识别三元组：<角色/Actor, 动作/Action, 客体/Object>，并映射到业务对象（如 用户/管理员/系统/外部服务）。\n"
-        '2) 原子化拆分：一条需求仅描述**单一可验证行为或约束**；遇到"且/并且/以及/或/同时"等连接词，必要时拆分为多条。\n'
-        "3) 去重与同义合并：合并等义表述，统一术语与量纲；避免重复。\n"
-        "4) 分类判别（启发式）：\n"
-        "   • FR-*（功能）：描述输入→处理→输出的可观察行为或接口交互。\n"
-        "   • NFR-*（非功能）：性能/容量（吞吐/并发/响应时延/峰值）、可靠性/可用性、可维护性、可移植性、\n"
-        "     安全（鉴权/审计/最小权限/加密/合规）、可观测性（日志/指标/追踪）。\n"
-        "   • CON-*（约束）：法律/合规/组织策略/平台边界/外部依赖/数据主权/部署与网络限制等不以功能体验为主的**强约束**。\n"
-        "5) 术语锚定：\n"
-        '   • 保留用户输入中的专有名词与单位；禁止发明新术语；如需补足名词，使用"前提：…"嵌入到 content 末尾。\n'
-        '6) 质量门槛：避免"可能/尽量/适当/TBD/？"等模糊词；可测试、可追踪；禁止问题式/澄清式输出。\n'
+        "[Parsing Method (done internally, do not appear in output)]\n"
+        "1) Identify triples: <Actor/Role, Action, Object>, and map to business objects (e.g., user/admin/system/external service).\n"
+        '2) Atomic splitting: Each requirement describes only **a single verifiable behavior or constraint**; when encountering conjunctions like "and/also/or/simultaneously", split into multiple items if necessary.\n'
+        "3) Deduplication and synonym merging: Merge equivalent expressions, unify terminology and units; avoid repetition.\n"
+        "4) Classification (heuristic):\n"
+        "   • FR-* (Functional): Describes observable behaviors or interface interactions of input→processing→output.\n"
+        "   • NFR-* (Non-functional): Performance/capacity (throughput/concurrency/response latency/peak), reliability/availability, maintainability, portability,\n"
+        "     security (authentication/audit/minimum privilege/encryption/compliance), observability (logs/metrics/tracing).\n"
+        "   • CON-* (Constraint): Legal/compliance/organizational policies/platform boundaries/external dependencies/data sovereignty/deployment and network constraints, etc., which are **strong constraints** not primarily focused on functional experience.\n"
+        "5) Terminology anchoring:\n"
+        '   • Preserve proper nouns and units from user input; prohibit inventing new terms; if nouns need to be supplemented, use "Prerequisite: ..." embedded at the end of content.\n'
+        '6) Quality threshold: Avoid vague words like "possibly/try to/appropriate/TBD/?"; testable, traceable; prohibit question-style/clarification-style output.\n'
         "\n"
-        "【编号规范】\n"
-        "- 功能需求：FR-01, FR-02, FR-03, ...（两位数字递增，起始01，连续且唯一）\n"
-        "- 非功能需求：NFR-01, NFR-02, ...（两位数字递增）\n"
-        "- 约束：CON-01, CON-02, ...（两位数字递增）\n"
-        "编号不得跳号或重复；三类序列相互独立。\n"
+        "[Numbering Convention]\n"
+        "- Functional requirements: FR-01, FR-02, FR-03, ... (two-digit increment, starting from 01, consecutive and unique)\n"
+        "- Non-functional requirements: NFR-01, NFR-02, ... (two-digit increment)\n"
+        "- Constraints: CON-01, CON-02, ... (two-digit increment)\n"
+        "Numbers must not skip or repeat; the three sequences are independent.\n"
         "\n"
-        "【输出格式（仅 JSON 数组，元素字段仅含 id 与 content）】\n"
+        "[Output Format (JSON array only, elements contain only id and content)]\n"
         "```json\n"
         '[{{"id":"FR-01","content":"……"}}]\n'
         "```\n"
-        "不得出现除 id、content 之外的字段；不得输出解释、表格或注释。\n"
+        "No fields other than id and content may appear; no explanations, tables, or comments may be output.\n"
         "\n"
         "---\n"
         "\n"
-        "用户需求：\n"
+        "User Requirements:\n"
         "{user_input}\n"
         "\n"
-        "请仅输出结构化 JSON 数组（外层使用 ```json 围栏，数组元素仅含 id 与 content）。"
+        "Please output only a structured JSON array (outer layer uses ```json fence, array elements contain only id and content)."
     )
 
     user = user_template.format(user_input=state["user_input"])
@@ -399,72 +399,72 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     scores_arr_unfrozen_json = json.dumps(scores_arr_unfrozen, ensure_ascii=False)
 
     user_template = (
-        '你是"需求挖掘智能体（ReqExplore）"，资深需求工程师与闭环设计专家。只对**未冻结且未移除**的条目进行优化；\n'
-        "冻结条目与已移除条目严禁修改，也不要出现在输出中（系统稍后合并）。\n"
+        'You are the "Requirement Exploration Agent (ReqExplore)", a senior requirements engineer and closed-loop design expert. Only optimize **unfrozen and non-removed** items;\n'
+        "Frozen items and removed items are strictly prohibited from modification and must not appear in the output (the system will merge them later).\n"
         "\n"
-        "【你将收到】\n"
-        "- 未冻结条目清单（id, content）\n"
-        "- 这些条目的评分（来自上一轮澄清）\n"
-        "- （只读）冻结清单\n"
-        "- （只读）已移除清单（禁止复提/改写）\n"
+        "[What You Will Receive]\n"
+        "- Unfrozen item list (id, content)\n"
+        "- Scores for these items (from the previous clarification round)\n"
+        "- (Read-only) Frozen list\n"
+        "- (Read-only) Removed list (prohibited from re-mentioning/rewriting)\n"
         "\n"
-        "【评分改进方向】\n"
-        "+2（强采纳）：仅做文字精炼与条理化；**不新增**条目，不改变语义。\n"
-        "+1（采纳）：在**不改变意图**前提下补齐验证口径：输入/输出、权限与审计、异常与回退、数据一致性与幂等、\n"
-        "             可观测性（日志/指标/追踪）；可进行轻量结构化；如确需支撑，可近邻新增 ≤2 条直接依赖项。\n"
-        '0（中性）：保持或泛化表述，将不确定假设前置为"前提：…"，并转换为**可检验**表达；**不新增**条目。\n'
-        "-1（不采纳）：在不扩张范围的前提下重写或替代，使之贴合**角色/触发/结果/失败策略/一致性**；可新增 ≤2 条近邻支撑项。\n"
-        "-2（强不采纳）：**从清单中剔除该 id**；不得新增替代；且**禁止以 FR/NFR/CON/SUG 任意形式复提或近义改写**。\n"
+        "[Score-Based Improvement Directions]\n"
+        "+2 (Strong Adoption): Only refine wording and structure; **do not add** items, do not change semantics.\n"
+        "+1 (Adoption): Under the premise of **not changing intent**, supplement verification criteria: input/output, permissions and audit, exceptions and rollback, data consistency and idempotency,\n"
+        "             observability (logs/metrics/tracing); light structuring is allowed; if support is truly needed, add ≤2 directly dependent items in proximity.\n"
+        '0 (Neutral): Maintain or generalize expression, prefix uncertain assumptions as "Prerequisite: ...", and convert to **verifiable** expressions; **do not add** items.\n'
+        "-1 (Non-adoption): Rewrite or replace without expanding scope, making it fit **role/trigger/result/failure strategy/consistency**; may add ≤2 supporting items in proximity.\n"
+        "-2 (Strong Non-adoption): **Remove this id from the list**; must not add alternatives; and **prohibit re-mentioning or near-synonym rewriting in any form of FR/NFR/CON/SUG**.\n"
         "\n"
-        "【闭环要素】\n"
-        "- 触发与输入、处理逻辑、输出与验收口径、异常与回退、访问控制与审计、一致性与幂等、可观测性、前提条件。\n"
-        '- 单位/阈值/量纲要明确，避免含混词（如"快速""较多"）。\n'
+        "[Closed-Loop Elements]\n"
+        "- Trigger and input, processing logic, output and acceptance criteria, exceptions and rollback, access control and audit, consistency and idempotency, observability, prerequisites.\n"
+        '- Units/thresholds/quantities must be clear, avoid ambiguous words (e.g., "fast", "many").\n'
         "\n"
-        "【近邻外推】\n"
-        "- 仅围绕当前条目的必要上下游步骤与合规/可靠/可观测性支撑；禁止跨域扩张，不得引入新模块/新角色/新数据域。\n"
-        '- "必要"判定：若缺失该支撑，将导致条目**不可验证或不可运行**。\n'
+        "[Proximity Extrapolation]\n"
+        "- Only around necessary upstream/downstream steps and compliance/reliability/observability support for current items; prohibit cross-domain expansion, must not introduce new modules/new roles/new data domains.\n"
+        '- "Necessary" determination: If this support is missing, it will cause the item to be **unverifiable or non-operational**.\n'
         "\n"
-        "【术语与一致性】\n"
-        '- 术语沿用既有清单与用户原文；单位/阈值/量纲要明确，不要含混词（如"快速""较多"）。\n'
-        '- 不发明新概念；必要假设用"前提：…"列出，勿用 TBD/？ 等占位。\n'
+        "[Terminology and Consistency]\n"
+        '- Terminology follows existing list and user original text; units/thresholds/quantities must be clear, do not use ambiguous words (e.g., "fast", "many").\n'
+        '- Do not invent new concepts; necessary assumptions should be listed with "Prerequisite: ...", do not use TBD/? as placeholders.\n'
         "\n"
-        "【编号与冲突】\n"
-        '- 仅输出"未冻结 + 新增"条目；**不要**输出任何冻结或已移除条目。\n'
-        "- 新增条目编号：在各自序列（FR/NFR/CON/SUG）末尾顺延；避免与现有 id 冲突；保持未冻结 id 的相对顺序稳定。\n"
-        "- 不得复提 removed_ids 中任何 id 或其近义改写。\n"
+        "[Numbering and Conflicts]\n"
+        "- Only output \"unfrozen + new\" items; **do not** output any frozen or removed items.\n"
+        "- New item numbering: Continue sequentially at the end of respective sequences (FR/NFR/CON/SUG); avoid conflicts with existing ids; maintain stable relative order of unfrozen ids.\n"
+        "- Must not re-mention any id in removed_ids or its near-synonym rewrites.\n"
         "\n"
-        "【自检清单】\n"
-        '- 是否形成"触发→处理→输出→异常/回退→访问控制/审计→一致性/幂等→可观测性→前提"的可验证闭环？\n'
-        '- 是否删除模糊词并给出阈值/口径？是否显式列出"前提：…"？\n'
-        "- 是否严格遵循分数动作边界（+2/0 不新增；-2 必剔除且禁复提）？\n"
-        "- 输出是否为**合法 JSON**，元素仅含 id 与 content？\n"
+        "[Self-Check List]\n"
+        '- Does it form a verifiable closed loop of "trigger→processing→output→exception/rollback→access control/audit→consistency/idempotency→observability→prerequisite"?\n'
+        '- Are vague words removed and thresholds/criteria given? Are "Prerequisite: ..." explicitly listed?\n'
+        "- Are score action boundaries strictly followed (+2/0 no addition; -2 must remove and prohibit re-mention)?\n"
+        "- Is the output **valid JSON**, with elements containing only id and content?\n"
         "\n"
-        "【（只读）冻结清单】：\n"
+        "[(Read-only) Frozen List]:\n"
         "{frozen_payload_json}\n"
         "\n"
-        "【（只读）已移除清单（禁复提/改写）】：\n"
+        "[(Read-only) Removed List (prohibited from re-mentioning/rewriting)]:\n"
         "{removed_payload_json}\n"
         "\n"
         "---\n"
         "\n"
-        "未冻结且未移除清单（JSON）：\n"
+        "Unfrozen and Non-removed List (JSON):\n"
         "```json\n"
         "{unfrozen_list_json}\n"
         "```\n"
         "\n"
-        "评分（仅未冻结且未移除项，JSON）：\n"
+        "Scores (unfrozen and non-removed items only, JSON):\n"
         "```json\n"
         "{scores_arr_unfrozen_json}\n"
         "```\n"
         "\n"
-        "（只读）冻结清单（请勿输出或修改）：\n"
+        "(Read-only) Frozen List (please do not output or modify):\n"
         "{frozen_payload_json}\n"
         "\n"
-        "（只读）已移除清单（请勿复提/改写）：\n"
+        "(Read-only) Removed List (please do not re-mention/rewrite):\n"
         "{removed_payload_json}\n"
         "\n"
-        '请输出"仅含未冻结及新增 id"的清单（外层用 ```json 围栏；元素仅含 id, content）。'
-        "禁止包含任何冻结或已移除 id。"
+        'Please output a list "containing only unfrozen and new ids" (outer layer uses ```json fence; elements contain only id, content).'
+        "Prohibit including any frozen or removed ids."
     )
 
     user = user_template.format(
@@ -549,34 +549,34 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     unfrozen_list_json = json.dumps(unfrozen_list, ensure_ascii=False)
 
     user_template = (
-        '你是"需求澄清智能体（ReqClarify）"，以**需求方/验收方**立场对"未冻结"的需求逐条评分；'
-        '以"基准 SRS"为唯一标尺，锚定术语/量纲/阈值/角色称谓，禁止引入新需求或改写原文。\n'
+        'You are the "Requirement Clarification Agent (ReqClarify)", scoring "unfrozen" requirements item by item from the **requester/acceptor** perspective;'
+        'using "Reference SRS" as the sole standard, anchoring terminology/units/thresholds/role names, prohibiting introducing new requirements or rewriting the original text.\n'
         "\n"
-        "【评分口径】\n"
-        "+2（强采纳）：与基准 SRS 一致或更优；语义完整、可测试、边界清晰、无含糊词。\n"
-        "+1（采纳）：基本一致，仅缺少少量可验证细节（异常/权限/可观测性等）。\n"
-        "0（中性）：信息不足或不确定假设过多，需条件化或补充验证口径后再评估。\n"
-        "-1（不采纳）：与角色/范围/触发/结果/失败策略/一致性等存在明显缺口或偏差，应重写或替代。\n"
-        "-2（强不采纳）：与目标/约束/合规严重冲突或跨域；**应直接移除，并在后续迭代禁止复提或近义改写**。\n"
+        "[Scoring Criteria]\n"
+        "+2 (Strong Adoption): Consistent with or better than reference SRS; semantically complete, testable, clear boundaries, no ambiguous words.\n"
+        "+1 (Adoption): Basically consistent, only missing a few verifiable details (exceptions/permissions/observability, etc.).\n"
+        "0 (Neutral): Insufficient information or too many uncertain assumptions, need to condition or supplement verification criteria before re-evaluation.\n"
+        "-1 (Non-adoption): Obvious gaps or deviations in role/scope/trigger/result/failure strategy/consistency, etc., should be rewritten or replaced.\n"
+        "-2 (Strong Non-adoption): Severely conflicts with goals/constraints/compliance or cross-domain; **should be directly removed, and prohibited from re-mentioning or near-synonym rewriting in subsequent iterations**.\n"
         "\n"
-        "【一致性约束】\n"
-        "• 必须对输入的每一条未冻结需求逐条给出评分；顺序与长度与输入一致；id 一一对应。\n"
-        '• 仅输出一个 ```json 围栏包裹的数组：[{{"id":"FR-01","score":1,"reason":"..."}}]。\n'
-        "• reason 简洁可审计（≤50字）。\n"
+        "[Consistency Constraints]\n"
+        "• Must score each unfrozen requirement in the input item by item; order and length must match the input; ids must correspond one-to-one.\n"
+        '• Output only one array wrapped in ```json fence: [{{"id":"FR-01","score":1,"reason":"..."}}].\n'
+        "• reason should be concise and auditable (≤50 characters).\n"
         "\n"
         "---\n"
         "\n"
-        "需评分（未冻结）需求清单：\n"
+        "Requirements to Score (unfrozen) List:\n"
         "```json\n"
         "{unfrozen_list_json}\n"
         "```\n"
         "\n"
-        "基准 SRS：\n"
+        "Reference SRS:\n"
         "```text\n"
         "{reference_srs}\n"
         "```\n"
         "\n"
-        "请输出评分 JSON 数组（使用 ```json``` 包裹）："
+        "Please output scoring JSON array (wrapped with ```json```):"
     )
 
     user = user_template.format(
@@ -660,15 +660,15 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
     effective_req_list_json = json.dumps(effective_req_list, ensure_ascii=False)
 
     user_template = (
-        '你是"文档生成智能体（DocGenerate）"。请将优化后的需求清单转化为'
-        "遵循 IEEE Std 830-1998 的软件需求规格说明书（SRS），输出介质为 Markdown。\n"
-        '• 语言正式、无二义、可测试；避免使用"可能/大概/TBD"等不确定措辞。\n'
-        "最终需求清单（JSON 数组）：\n"
+        'You are the "Document Generation Agent (DocGenerate)". Please convert the optimized requirement list into'
+        "a Software Requirements Specification (SRS) following IEEE Std 830-1998, with Markdown as the output medium.\n"
+        '• Language should be formal, unambiguous, and testable; avoid uncertain expressions like "possibly/probably/TBD".\n'
+        "Final Requirement List (JSON array):\n"
         "```json\n"
         "{effective_req_list_json}\n"
         "```\n"
         "\n"
-        "请输出遵循 IEEE Std 830-1998 基本格式的 Markdown 版本 SRS："
+        "Please output a Markdown version SRS following the basic format of IEEE Std 830-1998:"
     )
 
     user = user_template.format(effective_req_list_json=effective_req_list_json)

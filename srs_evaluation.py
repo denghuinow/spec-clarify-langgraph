@@ -144,52 +144,52 @@ def evaluate_srs(
     # 优先使用 OPENAI_EVALUATION_MODEL，如果未设置则回退到 OPENAI_MODEL
     model = model or os.environ.get("OPENAI_EVALUATION_MODEL") or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     
-    user_prompt = f"""你是一名严格的SRS需求评审打分助手。
+    user_prompt = f"""You are a strict SRS requirement review scoring assistant.
 
-任务：以“基准需求文档”为真值，对“用户需求文档”进行比对，只输出结构化分数 JSON，不输出任何说明文字、表格、代码块或多余字段。
+Task: Using the "reference requirement document" as ground truth, compare it with the "user requirement document", output only structured score JSON, do not output any explanatory text, tables, code blocks, or extra fields.
 
-评分要求（均为 0~1 浮点数，保留 4 位以内精度即可）：
+Scoring Requirements (all are 0~1 floating point numbers, 4 decimal places precision is sufficient):
 
-1. coverage（覆盖率）
-   定义：基准需求中被用户需求“完全覆盖”的条目计 1 分，“部分覆盖”计 0.5 分，“未覆盖”计 0 分；
-   coverage = (完全覆盖条目数 + 0.5 × 部分覆盖条目数) / 基准条目总数。
+1. coverage (Coverage)
+   Definition: Items in reference requirements that are "fully covered" by user requirements score 1 point, "partially covered" score 0.5 points, "not covered" score 0 points;
+   coverage = (fully covered items count + 0.5 × partially covered items count) / total reference items count.
 
-2. completeness（完整度）
-   维度：是否覆盖主要主流程、关键异常流程、边界条件、数据与状态、验收标准、合规/安全等。
-   高分表示“对已覆盖功能写得足够细致可用”。
+2. completeness (Completeness)
+   Dimensions: Whether it covers main primary flows, key exception flows, boundary conditions, data and state, acceptance criteria, compliance/security, etc.
+   High score means "covered functions are written in sufficient detail and are usable".
 
-3. consistency（一致性）
-   维度：用户需求内部是否自洽，是否与基准需求存在冲突或自相矛盾描述。
-   高分表示“无或极少明显冲突”。
+3. consistency (Consistency)
+   Dimensions: Whether user requirements are internally self-consistent, whether there are conflicts or self-contradictory descriptions with reference requirements.
+   High score means "no or very few obvious conflicts".
 
-4. testability（可验证性）
-   维度：需求是否可被验证（是否有清晰触发条件、期望结果、可测量标准，避免不可验证的笼统词语）。
-   高分表示“绝大多数条目可据此设计测试用例”。
+4. testability (Testability)
+   Dimensions: Whether requirements are verifiable (whether there are clear trigger conditions, expected results, measurable standards, avoiding unverifiable general terms).
+   High score means "most items can be used to design test cases".
 
-5. clarity（明确性）
-   维度：是否存在“快速”“合理”“友好”“尽可能”等模糊主观描述，是否有复合需求或歧义。
-   高分表示“表述清晰、粒度合适、歧义少”。
+5. clarity (Clarity)
+   Dimensions: Whether there are vague subjective descriptions like "fast", "reasonable", "friendly", "as much as possible", whether there are composite requirements or ambiguities.
+   High score means "clear expression, appropriate granularity, few ambiguities".
 
-6. traceability（可追溯性）
-   维度：用户需求是否能有清晰映射回基准需求（编号/标题/语义），是否易于构建RTM（需求追溯矩阵）。
-   高分表示“大部分需求都能清楚对应来源”。
+6. traceability (Traceability)
+   Dimensions: Whether user requirements can have clear mapping back to reference requirements (numbering/title/semantics), whether it is easy to build RTM (Requirements Traceability Matrix).
+   High score means "most requirements can clearly correspond to sources".
 
-7. scope_discipline（范围管理）
-   维度：是否大量引入超出基准范围的需求导致范围失控；是否对新增范围有清晰边界。
-   高分表示“范围收敛良好，新增点少且清楚标边界”。
+7. scope_discipline (Scope Management)
+   Dimensions: Whether it introduces many requirements beyond reference scope causing scope creep; whether there are clear boundaries for new scope.
+   High score means "scope converges well, few new points and clearly marked boundaries".
 
-8. by_category（按类别得分）
-   - functional：功能性需求整体质量（以上指标在功能需求子集上的综合表现）。
-   - non_functional：非功能性需求（性能、安全、可靠性、可用性等）相关质量。
-   - constraints：约束/接口/合规等强制性条目的覆盖与清晰度。
+8. by_category (Score by Category)
+   - functional: Overall quality of functional requirements (comprehensive performance of the above metrics on the functional requirements subset).
+   - non_functional: Quality related to non-functional requirements (performance, security, reliability, availability, etc.).
+   - constraints: Coverage and clarity of mandatory items such as constraints/interfaces/compliance.
 
-输出格式（必须严格满足）：
-- 仅输出一个 JSON 对象，禁止输出任何 Markdown、注释、自然语言说明或代码块标记。
-- JSON 顶层键仅包含：
+Output Format (must strictly satisfy):
+- Output only one JSON object, prohibit outputting any Markdown, comments, natural language explanations, or code block markers.
+- JSON top-level keys only include:
   - "metrics"
 
-其中：
-"metrics" : {
+Where:
+"metrics" : {{
   "coverage": <float>,
   "completeness": <float>,
   "consistency": <float>,
@@ -197,22 +197,22 @@ def evaluate_srs(
   "clarity": <float>,
   "traceability": <float>,
   "scope_discipline": <float>,
-  "by_category": {
+  "by_category": {{
     "functional": <float>,
     "non_functional": <float>,
     "constraints": <float>
-  }
-}
+  }}
+}}
 
-约束：
-- 不输出 RTM、不输出 gaps、不输出改写建议、不输出 Summary，不添加任何其他字段。
-- 若信息不足，请在分数中如实体现不确定性（给出保守分数），但仍然必须返回完整的上述字段，禁止输出解释文字。
-- 确保返回值是合法 JSON（双引号、逗号位置、布尔/数值格式均正确）。
+Constraints:
+- Do not output RTM, do not output gaps, do not output rewriting suggestions, do not output Summary, do not add any other fields.
+- If information is insufficient, please truthfully reflect uncertainty in the scores (give conservative scores), but still must return all the above fields, prohibit outputting explanatory text.
+- Ensure the return value is valid JSON (double quotes, comma positions, boolean/numeric formats are all correct).
 
-【基准需求】
+[Reference Requirements]
 {standard_srs}
 
-【用户需求】
+[User Requirements]
 {evaluated_srs}
 """
 
