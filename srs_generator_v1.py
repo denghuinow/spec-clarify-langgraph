@@ -793,11 +793,14 @@ def should_continue(state: GraphState) -> str:
     if state.get("ablation_mode") == "no-clarify":
         log("条件判断：no-clarify 模式，ReqExplore 执行一次后直接进入文档生成")
         return "DocGenerate"
-    if state["iteration"] > state["max_iterations"]:
-        log("条件判断：达到最大迭代次数，进入文档生成")
+    iteration = state.get("iteration", 0)
+    max_iterations = state.get("max_iterations", 5)
+    if iteration < max_iterations:
+        log(f"条件判断：迭代 {iteration}/{max_iterations}，继续迭代优化需求清单")
+        return "ReqExplore"
+    else:
+        log(f"条件判断：迭代已达到上限 {max_iterations}，进入文档生成")
         return "DocGenerate"
-    log("条件判断：继续迭代优化需求清单")
-    return "ReqExplore"
 
 
 def build_graph(ablation_mode: Optional[str] = None):
