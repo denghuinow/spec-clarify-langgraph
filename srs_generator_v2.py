@@ -119,7 +119,7 @@ def get_agent_temperature(agent: str) -> float:
     """
     defaults = {
         "ReqParse": 0.2,
-        "ReqExplore": 0.5,
+        "ReqExplore": 0.7,
         "ReqClarify": 0.2,
         "DocGenerate": 0.1,
     }
@@ -150,7 +150,7 @@ def get_llm(
     if callbacks:
         kwargs["callbacks"] = callbacks
     # 软性支持：若 SDK 识别，以下可生效；不识别则被忽略，不影响运行
-    kwargs.setdefault("timeout", 120)
+    kwargs.setdefault("timeout", 600)
     kwargs.setdefault("max_retries", 3)
     return ChatOpenAI(**kwargs)
 
@@ -370,6 +370,7 @@ class GraphState(TypedDict):
     req_last_iteration: Dict[str, int]  # 每个需求最后出现的迭代轮次 {req_id: iteration}
     req_last_clarify_iteration: Dict[str, int]  # 每个需求最后一次被评分的迭代轮次 {req_id: iteration}
     banned_ids: List[str]  # 被禁用的需求ID列表（负分需求的ID）
+    agent_timings: Dict[str, float]  # 记录每个智能体的耗时（秒）
 
 
 # -----------------------------
@@ -447,16 +448,21 @@ def get_req_explore_system_prompt() -> str:
    - 本轮必须保留该 id；
    - 仅允许极轻微措辞调整，不改变业务含义、范围、角色、状态；
    - 不拆分、不合并。
+   - **允许补充必要的支持性需求**：在保持核心业务含义不变的前提下，可以使用新 id 补充必要的支持性业务需求（如异常处理、权限验证、数据完整性检查等），确保业务闭环完整性。但应谨慎，仅补充明显缺失且必要的支持性需求。
 
 2. score = +1（采纳）
    - 本轮保留该 id；
    - 可以在不改变核心业务含义的前提下：
      - 提高叙述清晰度；
      - 补全必要的业务前提、触发条件、可见结果；
-   - 允许适度拆分：
+   - **鼓励系统化挖掘支持性业务需求**：
      - 原 id 作为主需求保留；
-     - 与其紧密相关的子场景可拆出 1~2 条新需求（新 id），仅当该需求确实隐含多个明确的业务场景时；
-     - 可以适度补全该需求隐含的必要业务要素，但不鼓励系统化挖掘大量支持性业务需求（深度挖掘应在 0 分需求时进行）；
+     - 系统化检查并补充必要的支持性业务需求（使用新 id），包括但不限于：
+       * 异常处理场景（输入错误、权限不足、数据缺失、业务规则不满足等）
+       * 权限与角色控制
+       * 数据完整性与一致性验证
+       * 业务状态转换与前置条件检查
+     - 最多可生成 3~5 条支持性业务需求（新 id），确保业务闭环完整性；
      - 严禁借机引入全新业务模块或与原意无关的能力。
 
 3. score = 0（中性）
@@ -465,8 +471,12 @@ def get_req_explore_system_prompt() -> str:
      - 去除含糊、堆叠或多流程混写；
      - 输出为可验证的业务行为，不新增新模块。
    - **这是深度挖掘和扩展的主要场景**：因为原需求表述模糊、混合多点或无法从 SRS 明确验证，需要澄清。
-   - 鼓励挖掘业务变体场景（正常/异常/边界情况），使用新 id 表达这些变体。
-   - 鼓励系统化挖掘该需求相关的上下游业务场景、异常处理、权限控制等支持性业务需求，使用新 id 表达。
+   - **必须进行系统化挖掘**：
+     - 明显重写该需求（使用同一 id），聚焦单一业务场景；
+     - 鼓励拆分为多个明确的业务场景，每个场景聚焦单一业务行为，使用不同 id 表达；
+     - 鼓励识别业务变体（正常流程、异常流程、边界情况），使用不同 id 表达；
+     - **必须系统化挖掘**该需求相关的上下游业务场景、异常处理、权限控制、数据验证、状态转换等所有支持性业务需求，使用新 id 表达；
+     - 确保拆分后的需求在业务上可验证、可测试，形成完整的业务闭环。
    - 不因 0 分新建无关需求。
 
 4. score = -1（不采纳）
@@ -490,10 +500,10 @@ def get_req_explore_system_prompt() -> str:
 基于评分结果，采用以下扩展策略：
 
 1. 高分需求（+2/+1）：
-   - **保守调整策略**：因为评分含义是"与 SRS 一致"或"仅有轻微表述差异"，不应大量扩展。
-   - +2 分：仅允许极轻微措辞调整，不拆分、不合并。
-   - +1 分：允许轻微措辞调整和补全必要的业务要素（前提、触发条件、可见结果），最多允许 1~2 条紧密相关的子场景拆分。
-   - 主要目标是补全必要业务要素，确保业务闭环的完整性，但不鼓励系统化挖掘大量支持性业务需求。
+   - **适度扩展策略**：虽然评分含义是"与 SRS 一致"或"仅有轻微表述差异"，但为确保业务闭环完整性，应系统化检查并补充必要的支持性业务需求。
+   - +2 分：仅允许极轻微措辞调整，不拆分、不合并；但允许在保持核心业务含义不变的前提下，使用新 id 补充明显缺失且必要的支持性业务需求（如异常处理、权限验证等）。
+   - +1 分：允许轻微措辞调整和补全必要的业务要素（前提、触发条件、可见结果）；**鼓励系统化挖掘支持性业务需求**，包括异常处理、权限控制、数据验证、状态转换等，最多可生成 3~5 条支持性业务需求（新 id）。
+   - 主要目标是补全必要业务要素，确保业务闭环的完整性，系统化识别并补充支持性业务需求，不遗漏关键业务场景。
 
 2. 中性需求（0）：
    - **深度挖掘和扩展的主要场景**：因为评分含义是"表述模糊、混合多点或无法从 SRS 明确验证，需重写澄清"。
@@ -517,33 +527,42 @@ def get_req_explore_system_prompt() -> str:
 
 每条需求应尽量在自然语言中体现完整的业务闭环，包括以下要素：
 
-1. **业务触发与输入**：
+1. **业务触发与输入**（必须包含）：
    - 明确谁（角色）、在什么业务情境下、基于什么前提条件触发该业务操作；
    - 输入的业务信息、数据、状态等前置条件。
+   - 示例："当用户（角色）在登录页面（业务情境）输入用户名和密码（输入）时，系统应..."
 
-2. **业务处理流程**：
+2. **业务处理流程**（必须包含）：
    - 系统应执行的业务规则、决策点、状态转换；
    - 业务逻辑判断（如校验信息是否完整、决定是否受理、将信息提供给哪个后续环节）。
+   - 示例："系统应验证用户身份信息是否完整、有效，并根据验证结果决定是否允许登录..."
 
-3. **业务结果与反馈**：
+3. **业务结果与反馈**（必须包含）：
    - 对用户/业务方可见的结果、确认信息、状态展示；
    - 如"显示确认信息及编号""展示当前处理状态""给出拒绝原因"。
+   - 示例："验证通过后，系统应显示登录成功信息并跳转到主页面；验证失败时，系统应提示错误原因..."
 
-4. **异常业务场景**：
+4. **异常业务场景**（必须包含）：
    - 信息缺失、条件不满足、权限不足等业务异常的处理；
    - 业务异常情况下的反馈和处理流程。
+   - 示例："当用户输入的用户名不存在时，系统应提示'用户名不存在'；当密码错误时，系统应提示'密码错误'并记录失败次数..."
 
-5. **业务权限与合规**：
+5. **业务权限与合规**（必须包含）：
    - 哪些角色可执行/查看该业务操作；
    - 业务合规要求、可追溯性（从业务视角描述，如"相关操作应可追溯，满足合规要求"）。
+   - 示例："仅注册用户可执行登录操作；系统应记录所有登录尝试，包括成功和失败，以满足安全审计要求..."
 
-6. **业务数据完整性**：
+6. **业务数据完整性**（必须包含）：
    - 业务数据的一致性要求（用业务语言描述，如"确保业务数据准确、完整"）；
    - 业务操作的幂等性（用业务语言描述，如"重复提交相同业务请求时，系统应识别并避免重复处理"）。
+   - 示例："系统应确保用户登录状态与用户身份信息保持一致；重复登录请求应被识别为同一操作..."
 
-7. **业务关联性**：
+7. **业务关联性**（建议包含）：
    - 与其他业务需求的关联、依赖关系；
    - 前置业务条件、后续业务影响。
+   - 示例："登录成功后，用户可访问个人中心、查看订单等后续功能..."
+
+**检查点**：在输出每条需求前，请自检是否包含了以上 1-6 项要素。如果某条需求缺少关键要素（如异常处理、权限控制），应使用新 id 补充相应的支持性业务需求，确保业务闭环完整性。
 
 这些要素应揉进一段自然业务描述，而非逐条罗列。确保业务闭环的完整性，不遗漏关键业务场景。
 
@@ -594,13 +613,73 @@ def get_req_explore_system_prompt() -> str:
    - 确保不遗漏关键业务场景，保持业务闭环的完整性。
 
 ====================
-九、总结要求
+十、结构化挖掘检查清单
+====================
+
+在挖掘需求时，请系统化检查以下维度，确保不遗漏关键业务场景：
+
+1. **正常流程变体**：
+   - 是否识别了所有合理的正常业务流程变体？
+   - 不同角色、不同业务情境下的流程是否有差异？
+
+2. **异常处理场景**（关键检查项）：
+   - 输入错误：用户输入格式错误、必填项缺失、数据类型不匹配等
+   - 权限不足：用户无权限执行操作、角色不匹配等
+   - 数据缺失：所需数据不存在、数据已被删除等
+   - 业务规则不满足：不满足业务前置条件、违反业务约束等
+   - 系统异常：系统临时不可用、数据冲突等
+   - 每种异常场景是否都有明确的业务处理流程和用户反馈？
+
+3. **边界条件**（关键检查项）：
+   - 空值处理：空字符串、空列表、空对象等
+   - 极值处理：最大值、最小值、超长字符串等
+   - 并发场景：同时操作同一资源、并发请求等
+   - 超时场景：操作超时、会话超时等
+   - 边界值是否都有明确的业务处理规则？
+
+4. **权限与角色控制**（关键检查项）：
+   - 哪些角色可以执行该操作？
+   - 哪些角色可以查看该信息？
+   - 不同角色是否有不同的操作权限？
+   - 权限验证是否在操作前进行？
+
+5. **数据完整性与一致性**（关键检查项）：
+   - 数据验证：输入数据是否符合业务规则？
+   - 数据一致性：相关数据是否保持一致？
+   - 数据完整性：必需数据是否完整？
+   - 数据冲突：如何处理数据冲突？
+
+6. **业务状态转换**：
+   - 业务对象有哪些状态？
+   - 状态转换的条件是什么？
+   - 状态转换的触发者是谁？
+   - 状态转换失败时如何处理？
+
+7. **前置条件与后置结果**：
+   - 执行该操作需要满足哪些前置条件？
+   - 操作成功后会产生哪些后置结果？
+   - 前置条件不满足时如何处理？
+   - 后置结果是否对用户可见？
+
+8. **业务关联与依赖**：
+   - 该需求依赖哪些其他业务需求？
+   - 该需求会影响哪些其他业务需求？
+   - 业务依赖关系是否清晰？
+
+**使用方式**：
+- 对于每条需求，特别是高分需求（+2/+1）和中性需求（0），请系统化检查以上 8 个维度
+- 如果发现缺失的关键业务场景，应使用新 id 补充相应的支持性业务需求
+- 优先检查异常处理、边界条件、权限控制、数据完整性等关键维度
+
+====================
+十一、总结要求
 ====================
 
 - 你是业务流程需求挖掘工具：写清楚"系统应该如何支持业务"，而不是"系统如何实现"。
 - 系统化挖掘业务需求，不遗漏关键业务场景，确保业务闭环完整性。
 - 遵守分值规则收敛，不在被否方向死磕。
 - 在业务范围内进行深度扩展，保持业务导向，避免技术细节泛滥。
+- 使用结构化挖掘检查清单，确保系统化识别所有关键业务场景。
 - 每轮输出：仅一个 JSON 数组，ID 合规、语义业务化、无技术细节泛滥。
 """
 
@@ -662,6 +741,7 @@ def get_req_clarify_system_prompt() -> str:
 # -----------------------------
 def req_parse_node(state: GraphState, llm=None) -> GraphState:
     """ReqParse：自然语言 -> 原子需求字符串数组"""
+    start_time = time.time()
     llm = llm or get_llm_for("ReqParse")
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
@@ -719,12 +799,17 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
     state["effective_req_list"] = []
     state["scores"] = {}
     state["iteration"] = current_iteration
-    log(f"ReqParse：解析完成，共 {len(normalized)} 条原子需求")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqParse"] = state["agent_timings"].get("ReqParse", 0.0) + elapsed
+    log(f"ReqParse：解析完成，共 {len(normalized)} 条原子需求，耗时 {elapsed:.2f} 秒")
     return state
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
     """ReqExplore（全局版）：一次性处理所有原子需求，输出全局业务需求清单"""
+    start_time = time.time()
     llm = llm or get_llm_for("ReqExplore")
     
     global_iteration = state.get("global_iteration", 0)
@@ -766,16 +851,53 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     if prev_scores:
         scores_arr = [{"id": rid, "score": sc} for rid, sc in prev_scores.items()]
         scores_arr_json = json.dumps(scores_arr, ensure_ascii=False)
+        
+        # 分析评分分布，提供针对性挖掘指导
+        high_score_ids = [rid for rid, sc in prev_scores.items() if sc >= 1]
+        zero_score_ids = [rid for rid, sc in prev_scores.items() if sc == 0]
+        negative_score_ids = [rid for rid, sc in prev_scores.items() if sc < 0]
+        
+        guidance_parts = []
+        guidance_parts.append("请严格按照系统提示中对各分值的规定执行：")
+        
+        if high_score_ids:
+            guidance_parts.append(f"- **得分为 +2 / +1 的需求（共 {len(high_score_ids)} 条）**：")
+            guidance_parts.append("  * 保留并仅微调这些需求；")
+            guidance_parts.append("  * **请系统化检查并补充必要的支持性业务需求**：")
+            guidance_parts.append("    - 使用新 id 补充异常处理场景（输入错误、权限不足、数据缺失、业务规则不满足等）")
+            guidance_parts.append("    - 使用新 id 补充权限与角色控制需求")
+            guidance_parts.append("    - 使用新 id 补充数据完整性与一致性验证需求")
+            guidance_parts.append("    - 使用新 id 补充业务状态转换与前置条件检查需求")
+            guidance_parts.append("    - 确保每条需求都形成完整的业务闭环（触发、处理、结果、异常、权限）")
+            guidance_parts.append("    - 参考系统提示中的「结构化挖掘检查清单」，系统化检查8个维度")
+            guidance_parts.append("    - +1 分需求最多可生成 3~5 条支持性业务需求，+2 分需求应谨慎补充")
+        
+        if zero_score_ids:
+            guidance_parts.append(f"- **得分为 0 的需求（共 {len(zero_score_ids)} 条）**：")
+            guidance_parts.append("  * 用相同 id 重写为更清晰单一的业务行为；")
+            guidance_parts.append("  * **请进行深度挖掘，识别所有业务场景变体和支持性需求**：")
+            guidance_parts.append("    - 拆分为多个明确的业务场景，每个场景使用不同 id")
+            guidance_parts.append("    - 识别业务变体（正常流程、异常流程、边界情况），使用不同 id 表达")
+            guidance_parts.append("    - 系统化挖掘上下游业务场景、异常处理、权限控制、数据验证、状态转换等所有支持性业务需求")
+            guidance_parts.append("    - 参考系统提示中的「结构化挖掘检查清单」，确保不遗漏关键业务场景")
+        
+        if negative_score_ids:
+            guidance_parts.append(f"- **得分为 -1 / -2 的需求（共 {len(negative_score_ids)} 条）**：")
+            guidance_parts.append("  * 删除这些需求，不再使用其 id，不再生成相同方向的需求；")
+        
+        guidance_parts.append("- 输出本轮「完整需求清单」，仅包含仍然有效的需求及在上述基础上产生的新需求。")
+        guidance_parts.append("")
+        guidance_parts.append("**重要提醒**：")
+        guidance_parts.append("- 请使用系统提示中的「结构化挖掘检查清单」（十、结构化挖掘检查清单），系统化检查8个维度")
+        guidance_parts.append("- 优先检查异常处理、边界条件、权限控制、数据完整性等关键维度")
+        guidance_parts.append("- 确保每条需求都包含业务闭环的6个必须要素（触发、处理、结果、异常、权限、数据完整性）")
+        
         user_parts.append(f"""【上一轮评分】
 ```json
 {scores_arr_json}
 ```
 
-请严格按照系统提示中对各分值的规定执行：
-- 保留并仅微调得分为 +2 / +1 的需求；
-- 对得分为 0 的需求，用相同 id 重写为更清晰单一的业务行为；
-- 删除得分为 -1 / -2 的需求，不再使用其 id，不再生成相同方向的需求；
-- 输出本轮"完整需求清单"，仅包含仍然有效的需求及在上述基础上产生的新需求。""")
+{chr(10).join(guidance_parts)}""")
     
     user_content = "\n\n".join(user_parts)
     messages = [
@@ -899,12 +1021,17 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
                 req_text_display = req_text
             log(f"  - ID: {req_id}, 文本: {req_text_display}")
     
-    log(f"ReqExplore：完成全局需求清单生成，共 {len(normalized_reqs)} 条需求")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqExplore"] = state["agent_timings"].get("ReqExplore", 0.0) + elapsed
+    log(f"ReqExplore：完成全局需求清单生成，共 {len(normalized_reqs)} 条需求，耗时 {elapsed:.2f} 秒")
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     """ReqClarify（全局版）：对全局需求清单全量打分"""
+    start_time = time.time()
     llm = llm or get_llm_for("ReqClarify")
     
     req_list = state.get("req_list", [])
@@ -913,6 +1040,10 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     if not req_list:
         log("ReqClarify：无需求清单，跳过评分")
         state["scores"] = {}
+        # 记录耗时（即使跳过也记录）
+        elapsed = time.time() - start_time
+        state.setdefault("agent_timings", {})
+        state["agent_timings"]["ReqClarify"] = state["agent_timings"].get("ReqClarify", 0.0) + elapsed
         return state
     
     log(f"ReqClarify（全局版）：对 {len(req_list)} 条全局需求进行评分")
@@ -1035,10 +1166,17 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     # 更新全局迭代轮次
     state["global_iteration"] = global_iteration + 1
     
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqClarify"] = state["agent_timings"].get("ReqClarify", 0.0) + elapsed
+    log(f"ReqClarify：评分完成，耗时 {elapsed:.2f} 秒")
+    
     return state
 
 
 def doc_generate_node(state: GraphState, llm=None) -> GraphState:
+    start_time = time.time()
     log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
     stream_handler = StreamingPrinter()
     llm = llm or get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
@@ -1153,7 +1291,11 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 
     state["srs_output"] = full_text
     state["srs_stream_printed"] = True
-    log("DocGenerate：流式输出完成")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["DocGenerate"] = state["agent_timings"].get("DocGenerate", 0.0) + elapsed
+    log(f"DocGenerate：流式输出完成，耗时 {elapsed:.2f} 秒")
     return state
 
 
@@ -1326,6 +1468,7 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "req_last_iteration": {},
         "req_last_clarify_iteration": {},
         "banned_ids": [],
+        "agent_timings": {},
     }
     config = {"recursion_limit": 1000}
     if not silent:

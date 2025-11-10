@@ -118,7 +118,7 @@ def get_llm(
     if callbacks:
         kwargs["callbacks"] = callbacks
     # 软性支持：若 SDK 识别，以下可生效；不识别则被忽略，不影响运行
-    kwargs.setdefault("timeout", 120)
+    kwargs.setdefault("timeout", 600)
     kwargs.setdefault("max_retries", 3)
     return ChatOpenAI(**kwargs)
 
@@ -285,6 +285,7 @@ class GraphState(TypedDict):
     removed_ids: List[str]
 
     ablation_mode: Optional[str]  # 消融实验模式：no-clarify 或 no-explore-clarify
+    agent_timings: Dict[str, float]  # 记录每个智能体的耗时（秒）
 
 
 # -----------------------------
@@ -292,6 +293,7 @@ class GraphState(TypedDict):
 # -----------------------------
 def req_parse_node(state: GraphState, llm=None) -> GraphState:
     """ReqParse：自然语言 -> 初始需求清单（JSON 数组，仅含 id 与 content）"""
+    start_time = time.time()
     llm = llm or get_llm_for("ReqParse")
     log("ReqParse：开始解析用户输入")
     current_iteration = state["iteration"] + 1
@@ -354,11 +356,16 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
         normalized.append({"id": rid, "content": content})
     state["req_list"] = normalized
     state["iteration"] = current_iteration
-    log(f"ReqParse：解析完成，共 {len(normalized)} 条需求")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqParse"] = state["agent_timings"].get("ReqParse", 0.0) + elapsed
+    log(f"ReqParse：解析完成，共 {len(normalized)} 条需求，耗时 {elapsed:.2f} 秒")
     return state
 
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
+    start_time = time.time()
     llm = llm or get_llm_for("ReqExplore")
     log(f"ReqExplore：第 {state['iteration']} 轮，根据评分强化挖掘与优化（仅处理未冻结且未移除项）")
     state.setdefault("frozen_ids", [])
@@ -552,9 +559,13 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
             merged.append({"id": rid, "content": content})
 
     state["req_list"] = merged
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqExplore"] = state["agent_timings"].get("ReqExplore", 0.0) + elapsed
     log(
         f"ReqExplore：强化挖掘完成，共 {len(state['req_list'])} 条；"
-        f"冻结 {len(state['frozen_ids'])} 条；已移除 {len(state['removed_ids'])} 条"
+        f"冻结 {len(state['frozen_ids'])} 条；已移除 {len(state['removed_ids'])} 条，耗时 {elapsed:.2f} 秒"
     )
     return state
 
@@ -571,6 +582,7 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     
     冻结策略：每轮评分后，最高正向分（>= +1）的所有需求进入冻结列表。
     """
+    start_time = time.time()
     llm = llm or get_llm_for("ReqClarify")
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
     state.setdefault("frozen_ids", [])
@@ -584,6 +596,10 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     if not unfrozen_list:
         log("ReqClarify：所有需求均已冻结，本轮跳过评分")
         state["scores"] = {}
+        # 记录耗时（即使跳过也记录）
+        elapsed = time.time() - start_time
+        state.setdefault("agent_timings", {})
+        state["agent_timings"]["ReqClarify"] = state["agent_timings"].get("ReqClarify", 0.0) + elapsed
         state["iteration"] += 1
         return state
 
@@ -682,12 +698,17 @@ def req_clarify_node(state: GraphState, llm=None) -> GraphState:
     else:
         log("ReqClarify：本轮无评分结果，未新增冻结项")
 
-    log("ReqClarify：评分记录完成（仅未冻结项）")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["ReqClarify"] = state["agent_timings"].get("ReqClarify", 0.0) + elapsed
+    log(f"ReqClarify：评分记录完成（仅未冻结项），耗时 {elapsed:.2f} 秒")
     state["iteration"] += 1
     return state
 
 
 def doc_generate_node(state: GraphState, llm=None) -> GraphState:
+    start_time = time.time()
     log("DocGenerate：生成最终 Markdown SRS 文档（流式输出开始）")
     stream_handler = StreamingPrinter()
     llm = llm or get_llm_for("DocGenerate", streaming=True, callbacks=[stream_handler])
@@ -780,7 +801,11 @@ def doc_generate_node(state: GraphState, llm=None) -> GraphState:
 
     state["srs_output"] = full_text
     state["srs_stream_printed"] = True
-    log("DocGenerate：流式输出完成")
+    # 记录耗时
+    elapsed = time.time() - start_time
+    state.setdefault("agent_timings", {})
+    state["agent_timings"]["DocGenerate"] = state["agent_timings"].get("DocGenerate", 0.0) + elapsed
+    log(f"DocGenerate：流式输出完成，耗时 {elapsed:.2f} 秒")
     return state
 
 
@@ -879,6 +904,7 @@ def run_demo(demo: DemoInput, silent: bool = False) -> GraphState:
         "frozen_reqs": {},
         "removed_ids": [],
         "ablation_mode": demo.ablation_mode,
+        "agent_timings": {},
     }
     final_state = app.invoke(init)
     if not silent:

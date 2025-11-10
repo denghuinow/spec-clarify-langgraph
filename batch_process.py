@@ -232,7 +232,7 @@ class BatchProcessor:
     
     def _get_generation_time_from_log(self, file_basename: str) -> Optional[float]:
         """
-        从日志文件中读取生成耗时
+        从日志文件中读取生成耗时（排除 ReqClarify 的耗时）
         
         Args:
             file_basename: 文件基础名称（不含扩展名）
@@ -262,9 +262,26 @@ class BatchProcessor:
                     with open(log_file, "r", encoding="utf-8") as f:
                         log_data = json.load(f)
                     
-                    # 读取 elapsed_time_seconds 字段
+                    # 优先读取 elapsed_time_seconds 字段（已排除 ReqClarify）
                     if "elapsed_time_seconds" in log_data:
                         return log_data["elapsed_time_seconds"]
+                    # 如果没有，尝试从 agent_timings 计算
+                    elif "agent_timings" in log_data:
+                        agent_timings = log_data["agent_timings"]
+                        if isinstance(agent_timings, dict):
+                            total_time = sum(agent_timings.values())
+                            clarify_time = agent_timings.get("ReqClarify", 0.0)
+                            return total_time - clarify_time
+                    # 向后兼容：如果有 elapsed_time_seconds_total，使用它
+                    elif "elapsed_time_seconds_total" in log_data:
+                        total_time = log_data["elapsed_time_seconds_total"]
+                        # 尝试从 agent_timings 中减去 ReqClarify 的耗时
+                        if "agent_timings" in log_data:
+                            agent_timings = log_data["agent_timings"]
+                            if isinstance(agent_timings, dict):
+                                clarify_time = agent_timings.get("ReqClarify", 0.0)
+                                return total_time - clarify_time
+                        return total_time
                 except (json.JSONDecodeError, IOError) as e:
                     self.log(f"警告: 读取日志文件失败 {log_file}: {str(e)}")
                     continue
@@ -767,6 +784,24 @@ class BatchProcessor:
             # 计算耗时
             elapsed_time = time.time() - start_time
             
+            # 从 final_state 获取 agent_timings，计算排除 ReqClarify 的总耗时
+            agent_timings = final_state.get("agent_timings", {})
+            elapsed_time_excluding_clarify = elapsed_time
+            if agent_timings:
+                # 计算所有智能体的总耗时
+                total_agent_time = sum(agent_timings.values())
+                # 排除 ReqClarify 的耗时
+                clarify_time = agent_timings.get("ReqClarify", 0.0)
+                elapsed_time_excluding_clarify = total_agent_time - clarify_time
+                # 如果计算出的排除耗时小于0或大于总耗时，使用总耗时作为兜底
+                if elapsed_time_excluding_clarify < 0:
+                    elapsed_time_excluding_clarify = elapsed_time
+                elif elapsed_time_excluding_clarify > elapsed_time:
+                    elapsed_time_excluding_clarify = elapsed_time - clarify_time
+            else:
+                # 如果没有 agent_timings，使用总耗时（向后兼容）
+                elapsed_time_excluding_clarify = elapsed_time
+            
             # 保存SRS文档
             srs_output_file = self.srs_output_dir / f"{file_basename}_srs.md"
             with open(srs_output_file, "w", encoding="utf-8") as f:
@@ -790,7 +825,9 @@ class BatchProcessor:
                 "max_iterations": self.max_iterations,
                 "ablation_mode": self.ablation_mode,
                 "final_iteration": final_state["iteration"],
-                "elapsed_time_seconds": elapsed_time,
+                "elapsed_time_seconds": elapsed_time_excluding_clarify,  # 使用排除 ReqClarify 的耗时
+                "elapsed_time_seconds_total": elapsed_time,  # 保存总耗时
+                "agent_timings": agent_timings,  # 保存各节点详细耗时
                 "req_list": final_state["req_list"],
                 "frozen_ids": frozen_ids,
                 "removed_ids": removed_ids,
@@ -814,7 +851,7 @@ class BatchProcessor:
             generator_summary_entry = {
                 "文件": file_basename,
                 "状态": "success",
-                "生成耗时(秒)": round(elapsed_time, 2),
+                "生成耗时(秒)": round(elapsed_time_excluding_clarify, 2),  # 使用排除 ReqClarify 的耗时
                 "使用模型": self.get_generator_model(),
                 "ReqExplore迭代次数": req_explore_iterations,
                 "消融实验模式": self.ablation_mode
@@ -823,7 +860,7 @@ class BatchProcessor:
             with self.generator_summary_lock:
                 self.generator_summary_data.append(generator_summary_entry)
             
-            self.log(f"✓ 文件 {file_basename} 生成完成，耗时: {elapsed_time:.2f} 秒")
+            self.log(f"✓ 文件 {file_basename} 生成完成，耗时: {elapsed_time_excluding_clarify:.2f} 秒（排除 ReqClarify，总耗时: {elapsed_time:.2f} 秒）")
             return {
                 "status": "success",
                 "file": file_basename,
@@ -839,7 +876,7 @@ class BatchProcessor:
             generator_summary_entry = {
                 "文件": file_basename,
                 "状态": "error",
-                "生成耗时(秒)": round(elapsed_time, 2),
+                "生成耗时(秒)": round(elapsed_time, 2),  # 错误情况下使用总耗时
                 "使用模型": self.get_generator_model(),
                 "ReqExplore迭代次数": None,
                 "消融实验模式": self.ablation_mode,

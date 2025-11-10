@@ -117,7 +117,8 @@ def evaluate_srs(
     standard_srs: str,
     evaluated_srs: str,
     model: Optional[str] = None,
-    temperature: float = 0.2
+    temperature: float = 0.2,
+    timeout: float = 600.0
 ) -> Dict[str, Any]:
     """
     评估SRS文档（使用OpenAI API）
@@ -127,6 +128,7 @@ def evaluate_srs(
         evaluated_srs: 待评估SRS文档
         model: 使用的模型名称（可选，默认从环境变量读取）
         temperature: 模型温度参数（默认: 0.2）
+        timeout: API调用超时时间（秒，默认: 600.0）
         
     Returns:
         评分结果字典，包含 Functional_Completeness, Interaction_Flow_Similarity, Total_Score, Summary
@@ -228,7 +230,8 @@ Constraints:
                 messages=[
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=temperature
+                temperature=temperature,
+                timeout=timeout
             )
             # 成功获取响应，跳出重试循环
             break
@@ -385,6 +388,12 @@ def main() -> None:
         default=0.2,
         help="模型温度参数（默认: 0.2）"
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=600.0,
+        help="API调用超时时间（秒，默认: 600.0）"
+    )
     
     # 输出
     parser.add_argument(
@@ -437,7 +446,8 @@ def main() -> None:
             standard_srs=standard_srs,
             evaluated_srs=evaluated_srs,
             model=args.model,
-            temperature=args.temperature
+            temperature=args.temperature,
+            timeout=args.timeout
         )
         
         # 打印结果
