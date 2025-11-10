@@ -144,16 +144,7 @@ def evaluate_srs(
     # 优先使用 OPENAI_EVALUATION_MODEL，如果未设置则回退到 OPENAI_MODEL
     model = model or os.environ.get("OPENAI_EVALUATION_MODEL") or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     
-    prompt = f"""
-    只输出 JSON
-【基准需求】
-{standard_srs}
-
-【用户需求】
-{evaluated_srs}
-"""
-    system_prompt = """
-你是一名严格的SRS需求评审打分助手。
+    user_prompt = f"""你是一名严格的SRS需求评审打分助手。
 
 任务：以“基准需求文档”为真值，对“用户需求文档”进行比对，只输出结构化分数 JSON，不输出任何说明文字、表格、代码块或多余字段。
 
@@ -217,13 +208,18 @@ def evaluate_srs(
 - 不输出 RTM、不输出 gaps、不输出改写建议、不输出 Summary，不添加任何其他字段。
 - 若信息不足，请在分数中如实体现不确定性（给出保守分数），但仍然必须返回完整的上述字段，禁止输出解释文字。
 - 确保返回值是合法 JSON（双引号、逗号位置、布尔/数值格式均正确）。
+
+【基准需求】
+{standard_srs}
+
+【用户需求】
+{evaluated_srs}
 """
 
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": user_prompt}
         ],
         temperature=temperature
     )
