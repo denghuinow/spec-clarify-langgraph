@@ -4,9 +4,15 @@ Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
 流程：ReqParse -> ReqExplore <-> ReqClarify -> DocGenerate -> END
 
-- ReqClarify：逐条评分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
-- ReqExplore：仅基于分数优化（只处理未冻结项），输出新版本清单（JSON 数组，仅含 id/content）
+- ReqParse：自然语言 -> 初始需求清单（JSON 数组，FR-01/NFR-01/CON-01 格式）
+- ReqExplore：仅基于分数优化（只处理未冻结且未移除项），输出新版本清单（JSON 数组，仅含 id/content）
+- ReqClarify：逐条评分（排除冻结项），评分范围：+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳
 - DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
+
+冻结与移除机制：
+- 冻结机制：每轮评分后，最高正向分（>= +1）的所有需求进入冻结列表（frozen_ids），后续不再修改
+- 移除机制：得分为 -2（强不采纳）的需求被标记为移除（removed_ids），后续不再处理
+- 冻结项和移除项在 ReqExplore 和 ReqClarify 中均被排除，确保已确定的需求不再变动
 """
 
 from __future__ import annotations
@@ -354,17 +360,16 @@ def req_parse_node(state: GraphState, llm=None) -> GraphState:
 
 def req_explore_node(state: GraphState, llm=None) -> GraphState:
     llm = llm or get_llm_for("ReqExplore")
-    log(f"ReqExplore：第 {state['iteration']} 轮，根据评分优化需求清单（冻结项不参与）")
+    log(f"ReqExplore：第 {state['iteration']} 轮，根据评分强化挖掘与优化（仅处理未冻结且未移除项）")
     state.setdefault("frozen_ids", [])
     state.setdefault("frozen_reqs", {})
     state.setdefault("removed_ids", [])
     frozen_ids_set = set(state["frozen_ids"])
     removed_ids_set = set(state["removed_ids"])
 
-    # 仅“未冻结&未移除”参与
+    # 仅“未冻结 & 未移除”参与本轮挖掘
     unfrozen_list = [
-        it
-        for it in state["req_list"]
+        it for it in state["req_list"]
         if it["id"] not in frozen_ids_set and it["id"] not in removed_ids_set
     ]
 
@@ -384,87 +389,109 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
     ]
     removed_payload = [{"id": rid} for rid in state["removed_ids"]]
 
-    # 预先序列化JSON字符串用于模板填充
-    frozen_payload_json = (
-        json.dumps(frozen_payload, ensure_ascii=False, indent=2)
-        if frozen_payload
-        else "无"
-    )
-    removed_payload_json = (
-        json.dumps(removed_payload, ensure_ascii=False, indent=2)
-        if removed_payload
-        else "无"
-    )
+    frozen_payload_json = json.dumps(frozen_payload, ensure_ascii=False, indent=2) if frozen_payload else "无"
+    removed_payload_json = json.dumps(removed_payload, ensure_ascii=False, indent=2) if removed_payload else "无"
     unfrozen_list_json = json.dumps(unfrozen_list, ensure_ascii=False)
     scores_arr_unfrozen_json = json.dumps(scores_arr_unfrozen, ensure_ascii=False)
 
     user_template = (
-        'You are the "Requirement Exploration Agent (ReqExplore)", a senior requirements engineer and closed-loop design expert. Only optimize **unfrozen and non-removed** items;\n'
-        "Frozen items and removed items are strictly prohibited from modification and must not appear in the output (the system will merge them later).\n"
+        'You are the "Requirement Exploration Agent (ReqExplore)", a senior requirements engineer and closed-loop design expert.\n'
+        "You must perform **aggressive but controlled expansion**, only on **unfrozen and non-removed** items.\n"
+        "Frozen items and removed items are strictly read-only and must NOT appear in your output.\n"
         "\n"
-        "[What You Will Receive]\n"
-        "- Unfrozen item list (id, content)\n"
-        "- Scores for these items (from the previous clarification round)\n"
-        "- (Read-only) Frozen list\n"
-        "- (Read-only) Removed list (prohibited from re-mentioning/rewriting)\n"
+        "[Your Goals]\n"
+        "1) For each unfrozen requirement, use its score and content to:\n"
+        "   - Improve clarity, testability, and structure.\n"
+        "   - Systematically derive ALL reasonably implied supporting requirements\n"
+        "     (functional, non-functional, constraints), as long as they:\n"
+        "       • Stay within the SAME business/domain scope;\n"
+        "       • Are strongly grounded in existing items or Reference SRS patterns;\n"
+        "       • Make the end-to-end behavior verifiable and operable.\n"
+        "2) Compared to a conservative mode, you are encouraged to generate MORE items\n"
+        "   when they are logically necessary, typical, or high-confidence implications.\n"
         "\n"
-        "[Score-Based Improvement Directions]\n"
-        "+2 (Strong Adoption): Only refine wording and structure; **do not add** items, do not change semantics.\n"
-        "+1 (Adoption): Under the premise of **not changing intent**, supplement verification criteria: input/output, permissions and audit, exceptions and rollback, data consistency and idempotency,\n"
-        "             observability (logs/metrics/tracing); light structuring is allowed; if support is truly needed, add ≤2 directly dependent items in proximity.\n"
-        '0 (Neutral): Maintain or generalize expression, prefix uncertain assumptions as "Prerequisite: ...", and convert to **verifiable** expressions; **do not add** items.\n'
-        "-1 (Non-adoption): Rewrite or replace without expanding scope, making it fit **role/trigger/result/failure strategy/consistency**; may add ≤2 supporting items in proximity.\n"
-        "-2 (Strong Non-adoption): **Remove this id from the list**; must not add alternatives; and **prohibit re-mentioning or near-synonym rewriting in any form of FR/NFR/CON/SUG**.\n"
+        "[Score-Based Exploration Strategy]\n"
+        "+2 (Strong Adoption):\n"
+        "   - Keep semantics strictly; refine wording/structure.\n"
+        "   - MAY add missing **fine-grained checks** tightly coupled to this item\n"
+        "     (e.g., explicit error handling, logging, audit, boundary cases)\n"
+        "     when obviously implied; avoid changing its scope.\n"
+        "+1 (Adoption):\n"
+        "   - Keep the core intent.\n"
+        "   - AGGRESSIVELY enumerate supporting requirements needed to test/operate it:\n"
+        "       • detailed input/output rules;\n"
+        "       • role/permission & audit;\n"
+        "       • exception handling & rollback;\n"
+        "       • data integrity & idempotency;\n"
+        "       • observability (logs/metrics/traces/alerts).\n"
+        "   - You MAY generate multiple new items around this requirement to cover the loop.\n"
+        "0 (Neutral):\n"
+        "   - Treat as a seed: clarify assumptions via verifiable expressions.\n"
+        "   - Split vague or overloaded text into multiple precise items.\n"
+        "   - Derive variants/scenarios (normal / abnormal / edge cases) when reasonable.\n"
+        "-1 (Non-adoption):\n"
+        "   - Rewrite or replace into a set of precise items that match scope & constraints.\n"
+        "   - If one vague item actually implies several concrete responsibilities,\n"
+        "     expand it into multiple new requirements.\n"
+        "-2 (Strong Non-adoption):\n"
+        "   - This id is handled outside you: DO NOT output or resurrect it,\n"
+        "     and DO NOT produce near-synonym replacements for it.\n"
         "\n"
-        "[Closed-Loop Elements]\n"
-        "- Trigger and input, processing logic, output and acceptance criteria, exceptions and rollback, access control and audit, consistency and idempotency, observability, prerequisites.\n"
-        '- Units/thresholds/quantities must be clear, avoid ambiguous words (e.g., "fast", "many").\n'
+        "[Aggressive Exploration Boundaries]\n"
+        "- You MAY create many new FR/NFR/CON/SUG items when:\n"
+        "   • They are direct upstream/downstream/operational/support requirements of existing items; or\n"
+        "   • They reflect standard, high-confidence practices (security, audit, monitoring, reliability)\n"
+        "     required to make current requirements pass real-world acceptance.\n"
+        "- You MUST NOT:\n"
+        "   • Introduce a completely new business domain/module unrelated to current list;\n"
+        "   • Invent new roles or external systems out of thin air;\n"
+        "   • Reintroduce any id from Removed List, or its near-synonyms.\n"
         "\n"
-        "[Proximity Extrapolation]\n"
-        "- Only around necessary upstream/downstream steps and compliance/reliability/observability support for current items; prohibit cross-domain expansion, must not introduce new modules/new roles/new data domains.\n"
-        '- "Necessary" determination: If this support is missing, it will cause the item to be **unverifiable or non-operational**.\n'
+        "[Numbering Rules]\n"
+        "- Only output **unfrozen + new** items.\n"
+        "- Do NOT output frozen ids and removed ids.\n"
+        "- For existing unfrozen ids: keep their ids, update contents as needed.\n"
+        "- For new items:\n"
+        "   • Use id prefixes FR-/NFR-/CON-/SUG- consistent with their nature;\n"
+        "   • Ensure no conflict with any existing id;\n"
+        "   • Continue sequences at the tail (you infer next numbers from context).\n"
         "\n"
-        "[Terminology and Consistency]\n"
-        '- Terminology follows existing list and user original text; units/thresholds/quantities must be clear, do not use ambiguous words (e.g., "fast", "many").\n'
-        '- Do not invent new concepts; necessary assumptions should be listed with "Prerequisite: ...", do not use TBD/? as placeholders.\n'
+        "[Closed-Loop Checklist for Each Area]\n"
+        "- Trigger & input conditions are explicit.\n"
+        "- Processing steps and decision rules are clear.\n"
+        "- Output and acceptance criteria are testable.\n"
+        "- Error/exception handling & rollback paths exist.\n"
+        "- Access control & audit trail are covered.\n"
+        "- Data consistency & idempotency are addressed when relevant.\n"
+        "- Observability: logs/metrics/traces/alerts for critical flows.\n"
+        "- Prerequisites are explicit via \"Prerequisite: ...\" in content if needed.\n"
+        "- Remove vague words (fast/many/robust/etc.) by adding thresholds.\n"
         "\n"
-        "[Numbering and Conflicts]\n"
-        "- Only output \"unfrozen + new\" items; **do not** output any frozen or removed items.\n"
-        "- New item numbering: Continue sequentially at the end of respective sequences (FR/NFR/CON/SUG); avoid conflicts with existing ids; maintain stable relative order of unfrozen ids.\n"
-        "- Must not re-mention any id in removed_ids or its near-synonym rewrites.\n"
-        "\n"
-        "[Self-Check List]\n"
-        '- Does it form a verifiable closed loop of "trigger→processing→output→exception/rollback→access control/audit→consistency/idempotency→observability→prerequisite"?\n'
-        '- Are vague words removed and thresholds/criteria given? Are "Prerequisite: ..." explicitly listed?\n'
-        "- Are score action boundaries strictly followed (+2/0 no addition; -2 must remove and prohibit re-mention)?\n"
-        "- Is the output **valid JSON**, with elements containing only id and content?\n"
+        "[Hard Output Constraints]\n"
+        "- You MUST return ONLY one JSON array wrapped by ```json ...```.\n"
+        "- Each element: {{\"id\":\"...\",\"content\":\"...\"}}.\n"
+        "- No extra keys, no comments, no natural-language explanation.\n"
+        "- Do NOT include any frozen id or removed id.\n"
         "\n"
         "[(Read-only) Frozen List]:\n"
         "{frozen_payload_json}\n"
         "\n"
-        "[(Read-only) Removed List (prohibited from re-mentioning/rewriting)]:\n"
+        "[(Read-only) Removed List (MUST NOT be mentioned/reintroduced)]:\n"
         "{removed_payload_json}\n"
         "\n"
         "---\n"
         "\n"
-        "Unfrozen and Non-removed List (JSON):\n"
+        "Unfrozen & Non-removed List (JSON):\n"
         "```json\n"
         "{unfrozen_list_json}\n"
         "```\n"
         "\n"
-        "Scores (unfrozen and non-removed items only, JSON):\n"
+        "Scores (for unfrozen & non-removed items, JSON):\n"
         "```json\n"
         "{scores_arr_unfrozen_json}\n"
         "```\n"
         "\n"
-        "(Read-only) Frozen List (please do not output or modify):\n"
-        "{frozen_payload_json}\n"
-        "\n"
-        "(Read-only) Removed List (please do not re-mention/rewrite):\n"
-        "{removed_payload_json}\n"
-        "\n"
-        'Please output a list "containing only unfrozen and new ids" (outer layer uses ```json fence; elements contain only id, content).'
-        "Prohibit including any frozen or removed ids."
+        "Now output the optimized + aggressively expanded list as a single JSON array (```json fenced)."
     )
 
     user = user_template.format(
@@ -485,7 +512,7 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         parsed_output=unfrozen_new_list,
     )
 
-    # 以新输出为准，合并冻结与未移除项；对越界新增/重复做去重校正
+    # 合并逻辑保持：冻结不动，移除不回流，新旧 unfrozen 替换 + 追加真正新增项
     new_map: Dict[str, str] = {}
     for it in unfrozen_new_list:
         rid = str(it.get("id"))
@@ -494,41 +521,56 @@ def req_explore_node(state: GraphState, llm=None) -> GraphState:
         content = str(it.get("content", "")).strip()
         if not content:
             continue
-        new_map[rid] = content  # 若重复，以最后一次为准
+        new_map[rid] = content  # 重复 id 以最后一次为准
 
     prev_ids_order = [str(it["id"]) for it in state["req_list"]]
 
     merged: List[Dict[str, str]] = []
     for rid in prev_ids_order:
         if rid in removed_ids_set:
-            continue  # 已移除，跳过
+            continue
         if rid in frozen_ids_set:
+            # 冻结项内容以 frozen_reqs 为准，兜底用旧值
             content = state["frozen_reqs"].get(
                 rid,
-                next((x["content"] for x in state["req_list"] if x["id"] == rid), ""),
+                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
             )
-            merged.append({"id": rid, "content": content})
+            if content:
+                merged.append({"id": rid, "content": content})
         else:
-            # 未冻结 -> 采用 new_map 中的更新；若不存在，则沿用旧值（模型可能未返回）
+            # 未冻结：若模型给出新内容则替换，否则沿用旧值
             content = new_map.get(
                 rid,
-                next((x["content"] for x in state["req_list"] if x["id"] == rid), ""),
+                next((x["content"] for x in state["req_list"] if x["id"] == rid), "")
             )
-            merged.append({"id": rid, "content": content})
+            if content and rid not in removed_ids_set:
+                merged.append({"id": rid, "content": content})
 
-    # 附加“真正新增”的条目（不在 prev_ids 中，且未移除）
+    # 附加真正新增的条目（不在原列表且未被标记移除）
     for rid, content in new_map.items():
         if rid not in prev_ids_order and rid not in removed_ids_set:
             merged.append({"id": rid, "content": content})
 
     state["req_list"] = merged
     log(
-        f"ReqExplore：完成合并，共 {len(state['req_list'])} 条；冻结 {len(state['frozen_ids'])} 条；已移除 {len(state['removed_ids'])} 条"
+        f"ReqExplore：强化挖掘完成，共 {len(state['req_list'])} 条；"
+        f"冻结 {len(state['frozen_ids'])} 条；已移除 {len(state['removed_ids'])} 条"
     )
     return state
 
 
 def req_clarify_node(state: GraphState, llm=None) -> GraphState:
+    """ReqClarify：对未冻结需求逐条评分（排除冻结项）
+    
+    评分规则：
+    - +2：强采纳，进入冻结列表
+    - +1：采纳，进入冻结列表
+    - 0：中性，需要重写澄清
+    - -1：不采纳，需要重写或替换
+    - -2：强不采纳，标记为移除
+    
+    冻结策略：每轮评分后，最高正向分（>= +1）的所有需求进入冻结列表。
+    """
     llm = llm or get_llm_for("ReqClarify")
     log(f"ReqClarify：第 {state['iteration']} 轮，对需求逐条评分（排除冻结项）")
     state.setdefault("frozen_ids", [])

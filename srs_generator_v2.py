@@ -2,13 +2,18 @@
 """
 Multi-Agent SRS Generation with LangGraph
 -----------------------------------------
-流程：ReqParse -> 串行处理所有原子需求（ReqExplore <-> ReqClarify）-> 汇总 -> DocGenerate -> END
+流程：ReqParse -> ReqExplore <-> ReqClarify（全局迭代）-> Aggregate -> DocGenerate -> END
 
 - ReqParse：自然语言 -> 原子需求字符串数组
-- ReqExplore：单条原子需求 -> 细化需求列表（支持迭代优化）
-- ReqClarify：对当前原子需求的细化需求进行评分
-- 串行处理：依次处理每个原子需求，每个原子需求独立进行 ReqExplore <-> ReqClarify 迭代循环
+- ReqExplore：一次性处理所有原子需求，输出全局业务需求清单（REQ-001格式，支持迭代优化）
+- ReqClarify：对全局需求清单全量打分（+2 强采纳，+1 采纳，0 中性，-1 不采纳，-2 强不采纳）
+- Aggregate：汇总并过滤需求（仅保留历史最高分 >= +1 的版本）
 - DocGenerate：输出 Markdown（IEEE Std 830-1998 基本格式）
+
+全局迭代机制：
+- 使用 global_iteration 控制迭代轮次
+- 负分需求（-1/-2）在 ReqClarify 后物理移除并加入 banned_ids，防止后续复用
+- 通过 req_max_scores 记录每个需求的历史最高分，用于 Aggregate 过滤
 """
 
 from __future__ import annotations

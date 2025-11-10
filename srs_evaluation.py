@@ -25,6 +25,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Dict, List, Any, Optional
 
 from dotenv import load_dotenv
@@ -216,14 +217,47 @@ Constraints:
 {evaluated_srs}
 """
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=temperature
-    )
-
+    # 重试机制：最多重试5次，使用指数退避（从2秒开始）
+    max_retries = 5
+    last_exception = None
+    
+    for retry_count in range(max_retries + 1):  # 0到5，共6次尝试（1次初始 + 5次重试）
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=temperature
+            )
+            # 成功获取响应，跳出重试循环
+            break
+        except Exception as e:
+            last_exception = e
+            
+            # 如果已经是最后一次尝试，不再等待，直接抛出异常
+            if retry_count >= max_retries:
+                print(
+                    f"警告: API请求失败，已重试 {max_retries} 次，放弃重试。",
+                    file=sys.stderr,
+                    flush=True
+                )
+                raise RuntimeError(
+                    f"API请求失败，已尝试 {max_retries + 1} 次（1次初始 + {max_retries} 次重试）。"
+                    f"最后一次错误: {type(e).__name__}: {str(e)}"
+                ) from e
+            
+            # 计算延迟时间：指数退避，从2秒开始
+            delay = 2 * (2 ** retry_count)  # 2s, 4s, 8s, 16s, 32s
+            
+            print(
+                f"警告: API请求失败 ({type(e).__name__}: {str(e)})，"
+                f"{delay} 秒后进行第 {retry_count + 1} 次重试（共 {max_retries} 次）...",
+                file=sys.stderr,
+                flush=True
+            )
+            time.sleep(delay)
+    
     content = response.choices[0].message.content.strip()
 
     # 尝试多种方式解析JSON
